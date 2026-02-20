@@ -1,0 +1,41 @@
+---
+# storage-viewer-clusterrole.yaml
+# Custom ClusterRole: storage-viewer
+#
+# Nadaje użytkownikom/grupom widoczność zasobów storage w klastrze:
+#   - PersistentVolumes      (odczyt — zasób klastrowy)
+#   - PersistentVolumeClaims (pełny CRUD — zasób namespace)
+#   - StorageClasses         (odczyt — zasób klastrowy)
+#   - VolumeSnapshots        (odczyt — jeśli zainstalowany CSI snapshot controller)
+#
+# Zastosowanie ręczne:
+#   oc apply -f files/storage-viewer-clusterrole.yaml
+#   oc adm policy add-cluster-role-to-group storage-viewer <nazwa-grupy>
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: storage-viewer
+  labels:
+    app.kubernetes.io/managed-by: ansible
+    rbac.openshift.io/aggregate-to-view: "true"
+rules:
+  # PersistentVolumes — zasób klastrowy, tylko odczyt
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+
+  # PersistentVolumeClaims — zasób namespace, pełny CRUD
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+
+  # StorageClasses — zasób klastrowy, tylko odczyt
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+
+  # VolumeSnapshots — opcjonalne, wymaga zainstalowanego CSI snapshot controller
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses", "volumesnapshots"]
+    verbs: ["get", "list", "watch"]
