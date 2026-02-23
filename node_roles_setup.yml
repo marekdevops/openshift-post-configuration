@@ -54,14 +54,22 @@
       failed_when: can_admin.stdout | trim != 'yes'
       tags: [always]
 
+    - name: "INFO — zalogowany jako"
+      ansible.builtin.debug:
+        msg: "Zalogowany jako: {{ oc_user.stdout }}"
+      tags: [always]
+
     - name: "INFO — role do skonfigurowania"
       ansible.builtin.debug:
-        msg:
-          - "Zalogowany jako : {{ oc_user.stdout }}"
-          - "Role do utworzenia :"
-          - "{% for role in node_roles %}"
-          - "  • {{ role.name }} — {{ role.nodes | length }} nodów, {{ role.namespaces | length }} namespace'ów"
-          - "{% endfor %}"
+        msg: >-
+          • {{ item.name }}
+          — nody: {{ item.nodes | length }}
+          — namespace'y: {{ item.namespaces | join(', ') }}
+          — MCP max_unavailable: {{ item.mcp.max_unavailable }}
+          — usuń rolę worker: {{ item.remove_worker_role | default(false) }}
+      loop: "{{ node_roles }}"
+      loop_control:
+        label: "{{ item.name }}"
       tags: [always]
 
     # -------------------------------------------------------------------------
