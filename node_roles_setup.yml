@@ -1,0 +1,219 @@
+---
+# =============================================================================
+# node_roles_setup.yml
+# Playbook: Tworzenie custom ról nodów w OpenShift
+#
+# Co robi (dla każdej roli z vars/node_roles.yml):
+#   1. Weryfikuje że wskazane nody istnieją w klastrze
+#   2. Nadaje nodom etykietę node-role.kubernetes.io/<name>
+#   3. Opcjonalnie usuwa etykietę node-role.kubernetes.io/worker
+#   4. Tworzy MachineConfigPool dziedziczący konfigurację z worker
+#   5. Ustawia annotation openshift.io/node-selector na wskazanych namespace'ach
+#   6. Weryfikuje wynik
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   pip install kubernetes
+#
+# Uruchomienie:
+#   ansible-playbook node_roles_setup.yml
+#   ansible-playbook node_roles_setup.yml --check          # dry-run
+#   ansible-playbook node_roles_setup.yml --tags label     # tylko labelowanie
+#   ansible-playbook node_roles_setup.yml --tags mcp       # tylko MCP
+#   ansible-playbook node_roles_setup.yml --tags namespace # tylko NS
+#
+# Klaster wykrywany z aktywnej sesji oc (~/.kube/config).
+# Wymagane uprawnienia: cluster-admin
+# =============================================================================
+
+- name: "OpenShift — konfiguracja custom ról nodów"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/node_roles.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Weryfikacja środowiska
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — aktywna sesja oc"
+      ansible.builtin.command: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+      tags: [always]
+
+    - name: "Weryfikacja — uprawnienia cluster-admin"
+      ansible.builtin.command: oc auth can-i '*' '*' --all-namespaces
+      register: can_admin
+      changed_when: false
+      failed_when: can_admin.stdout | trim != 'yes'
+      tags: [always]
+
+    - name: "INFO — role do skonfigurowania"
+      ansible.builtin.debug:
+        msg:
+          - "Zalogowany jako : {{ oc_user.stdout }}"
+          - "Role do utworzenia :"
+          - "{% for role in node_roles %}"
+          - "  • {{ role.name }} — {{ role.nodes | length }} nodów, {{ role.namespaces | length }} namespace'ów"
+          - "{% endfor %}"
+      tags: [always]
+
+    # -------------------------------------------------------------------------
+    # 1. Weryfikacja istnienia nodów
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — sprawdzenie czy wskazane nody istnieją"
+      ansible.builtin.command: oc get node {{ item.1 }}
+      loop: "{{ node_roles | subelements('nodes') }}"
+      loop_control:
+        label: "[{{ item.0.name }}] {{ item.1 }}"
+      register: node_check
+      changed_when: false
+      failed_when: node_check.rc != 0
+      tags: [always, label]
+
+    # -------------------------------------------------------------------------
+    # 2. Etykietowanie nodów
+    # -------------------------------------------------------------------------
+
+    - name: "Label — nadanie node-role.kubernetes.io/{{ item.0.name }}"
+      kubernetes.core.k8s:
+        state: present
+        api_version: v1
+        kind: Node
+        name: "{{ item.1 }}"
+        definition:
+          metadata:
+            labels:
+              "node-role.kubernetes.io/{{ item.0.name }}": ""
+      loop: "{{ node_roles | subelements('nodes') }}"
+      loop_control:
+        label: "node-role.kubernetes.io/{{ item.0.name }} → {{ item.1 }}"
+      tags: [label]
+
+    - name: "Label — usunięcie node-role.kubernetes.io/worker (jeśli remove_worker_role: true)"
+      ansible.builtin.command: >
+        oc label node {{ item.1 }}
+        node-role.kubernetes.io/worker-
+        --overwrite
+      loop: "{{ node_roles | subelements('nodes') }}"
+      loop_control:
+        label: "remove worker role → {{ item.1 }}"
+      when: item.0.remove_worker_role | default(false)
+      register: remove_worker_label
+      changed_when: "'labeled' in remove_worker_label.stdout or 'unlabeled' in remove_worker_label.stdout"
+      tags: [label]
+
+    # -------------------------------------------------------------------------
+    # 3. MachineConfigPool
+    # -------------------------------------------------------------------------
+
+    - name: "MachineConfigPool — tworzenie puli dla roli {{ item.name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfigPool
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          spec:
+            # Selekcja nodów: te z etykietą node-role.kubernetes.io/<name>
+            nodeSelector:
+              matchLabels:
+                "node-role.kubernetes.io/{{ item.name }}": ""
+
+            # Dziedziczenie MachineConfig: nody dostaną konfigurację OS/kubelet
+            # jak role z inherit_roles (domyślnie: worker) PLUS własne custom MC
+            machineConfigSelector:
+              matchExpressions:
+                - key: machineconfiguration.openshift.io/role
+                  operator: In
+                  values: "{{ item.mcp.inherit_roles + [item.name] }}"
+
+            # Ile nodów może być jednocześnie w trakcie aktualizacji
+            # Można podać liczbę (1, 2) lub procent ("33%")
+            maxUnavailable: "{{ item.mcp.max_unavailable }}"
+      loop: "{{ node_roles }}"
+      loop_control:
+        label: "MachineConfigPool/{{ item.name }}"
+      tags: [mcp]
+
+    # -------------------------------------------------------------------------
+    # 4. Namespace annotations
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — sprawdzenie czy wskazane namespace'y istnieją"
+      ansible.builtin.command: oc get namespace {{ item.1 }}
+      loop: "{{ node_roles | subelements('namespaces') }}"
+      loop_control:
+        label: "[{{ item.0.name }}] namespace/{{ item.1 }}"
+      register: ns_check
+      changed_when: false
+      failed_when: ns_check.rc != 0
+      tags: [namespace]
+
+    - name: "Namespace — ustawienie openshift.io/node-selector"
+      kubernetes.core.k8s:
+        state: present
+        api_version: v1
+        kind: Namespace
+        name: "{{ item.1 }}"
+        definition:
+          metadata:
+            annotations:
+              # Wymusza node-selector na wszystkich podach w tym namespace
+              # Pody bez zgodnego nodeSelector nie zostaną zaschedulowane
+              openshift.io/node-selector: "node-role.kubernetes.io/{{ item.0.name }}="
+      loop: "{{ node_roles | subelements('namespaces') }}"
+      loop_control:
+        label: "namespace/{{ item.1 }} → node-role.kubernetes.io/{{ item.0.name }}"
+      tags: [namespace]
+
+    # -------------------------------------------------------------------------
+    # 5. Weryfikacja końcowa
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — etykiety na nodach"
+      ansible.builtin.command: >
+        oc get nodes -l node-role.kubernetes.io/{{ item.name }}
+        -o custom-columns=NODE:.metadata.name,ROLES:.metadata.labels
+      loop: "{{ node_roles }}"
+      loop_control:
+        label: "rola: {{ item.name }}"
+      register: node_labels_check
+      changed_when: false
+      tags: [always]
+
+    - name: "Weryfikacja — stan MachineConfigPools"
+      ansible.builtin.command: >
+        oc get mcp {{ node_roles | map(attribute='name') | join(' ') }}
+      register: mcp_status
+      changed_when: false
+      tags: [always]
+
+    - name: "WYNIK — MachineConfigPools"
+      ansible.builtin.debug:
+        msg: "{{ mcp_status.stdout_lines }}"
+      tags: [always]
+
+    - name: "WYNIK — namespace annotations"
+      ansible.builtin.command: >
+        oc get namespace
+        {{ node_roles | map(attribute='namespaces') | flatten | unique | join(' ') }}
+        -o custom-columns=NS:.metadata.name,SELECTOR:.metadata.annotations.openshift\.io/node-selector
+      register: ns_annotations
+      changed_when: false
+      tags: [always]
+
+    - name: "WYNIK — namespace node-selector"
+      ansible.builtin.debug:
+        msg: "{{ ns_annotations.stdout_lines }}"
+      tags: [always]

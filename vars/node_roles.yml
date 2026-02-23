@@ -1,0 +1,72 @@
+---
+# vars/node_roles.yml
+# Konfiguracja custom ról nodów dla klastra OpenShift
+#
+# STRUKTURA:
+#   node_roles — lista ról. Każda rola definiuje:
+#     name                    — nazwa roli (bez prefiksu node-role.kubernetes.io/)
+#     description             — opis (do celów dokumentacyjnych)
+#     remove_worker_role      — czy usunąć etykietę worker z tych nodów
+#                               true  = nody należą TYLKO do tej puli (zalecane)
+#                               false = nody mają obie role (może powodować konflikty MCP)
+#     nodes                   — lista nazw nodów (oc get nodes -o name)
+#     namespaces              — NS których pody mają trafiać na te nody
+#                               annotation openshift.io/node-selector zostanie ustawiona
+#     mcp                     — konfiguracja MachineConfigPool
+#       max_unavailable       — ile nodów naraz aktualizować (int lub procent "33%")
+#       inherit_roles         — role MC do dziedziczenia (zwykle [worker])
+#                               nody dostaną konfigurację OS/kubelet jak worker + własne MC
+#
+# DODAWANIE NOWEJ ROLI:
+#   Skopiuj blok "- name: high-performance" poniżej i dostosuj.
+#   Playbook node_roles_setup.yml obsłuży wszystko automatycznie.
+#
+# UWAGA — kolejność MCP podczas aktualizacji klastra:
+#   OpenShift aktualizuje: master → custom pools (równolegle) → worker
+#   Aby priority pool aktualizował się PRZED workerami:
+#     oc patch mcp worker --type merge -p '{"spec":{"paused":true}}'
+#   Po zakończeniu priority pool:
+#     oc patch mcp worker --type merge -p '{"spec":{"paused":false}}'
+# ---------------------------------------------------------------------------
+
+node_roles:
+
+  - name: high-performance
+    description: "Nody dedykowane dla krytycznych aplikacji produkcyjnych"
+    remove_worker_role: true   # nody należą TYLKO do tej puli MCP
+
+    nodes:
+      - worker-node-1.example.com   # <-- zmień na rzeczywiste nazwy nodów
+      - worker-node-2.example.com   # oc get nodes -o name
+      - worker-node-3.example.com
+      - worker-node-4.example.com
+
+    namespaces:
+      - xyz    # <-- NS których pody mają schedulować się na te nody
+      - abc
+
+    mcp:
+      max_unavailable: 1      # ile nodów naraz idzie w aktualizację
+      inherit_roles:          # MC z tych ról będą aplikowane (OS config, kubelet)
+        - worker              # dziedziczy pełną konfigurację worker nodów
+
+
+  # ---------------------------------------------------------------------------
+  # Szablon dla kolejnej roli — odkomentuj i dostosuj
+  # ---------------------------------------------------------------------------
+  # - name: gpu-workers
+  #   description: "Nody z kartami GPU dla workloadów ML"
+  #   remove_worker_role: true
+  #
+  #   nodes:
+  #     - gpu-node-1.example.com
+  #     - gpu-node-2.example.com
+  #
+  #   namespaces:
+  #     - ml-project
+  #     - data-science
+  #
+  #   mcp:
+  #     max_unavailable: 1
+  #     inherit_roles:
+  #       - worker
