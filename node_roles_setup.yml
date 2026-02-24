@@ -146,7 +146,7 @@
 
             # Ile nodów może być jednocześnie w trakcie aktualizacji
             # Można podać liczbę (1, 2) lub procent ("33%")
-            maxUnavailable: "{{ item.mcp.max_unavailable }}"
+            maxUnavailable: "{{ item.mcp.max_unavailable if '%' in (item.mcp.max_unavailable | string) else (item.mcp.max_unavailable | int) }}"
       loop: "{{ node_roles }}"
       loop_control:
         label: "MachineConfigPool/{{ item.name }}"
