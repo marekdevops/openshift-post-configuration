@@ -98,8 +98,7 @@
         name: "{{ item.1 }}"
         definition:
           metadata:
-            labels:
-              "node-role.kubernetes.io/{{ item.0.name }}": ""
+            labels: "{{ {'node-role.kubernetes.io/' + item.0.name: ''} }}"
       loop: "{{ node_roles | subelements('nodes') }}"
       loop_control:
         label: "node-role.kubernetes.io/{{ item.0.name }} → {{ item.1 }}"
@@ -135,8 +134,7 @@
           spec:
             # Selekcja nodów: te z etykietą node-role.kubernetes.io/<name>
             nodeSelector:
-              matchLabels:
-                "node-role.kubernetes.io/{{ item.name }}": ""
+              matchLabels: "{{ {'node-role.kubernetes.io/' + item.name: ''} }}"
 
             # Dziedziczenie MachineConfig: nody dostaną konfigurację OS/kubelet
             # jak role z inherit_roles (domyślnie: worker) PLUS własne custom MC
