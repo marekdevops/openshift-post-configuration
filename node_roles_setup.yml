@@ -226,7 +226,7 @@
         msg: >-
           {{ item.metadata.name }}
           →  {{ item.metadata.annotations['openshift.io/node-selector'] | default('<brak>') }}
-      loop: "{{ (ns_annotations_raw.stdout | from_json).items }}"
+      loop: "{{ (ns_annotations_raw.stdout | from_json)['items'] }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       when: ns_annotations_raw is not failed
