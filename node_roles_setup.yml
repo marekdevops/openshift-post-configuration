@@ -210,16 +210,21 @@
         msg: "{{ mcp_status.stdout_lines }}"
       tags: [always]
 
-    - name: "WYNIK — namespace annotations"
-      ansible.builtin.command: >
+    - name: "WYNIK — namespace annotations (raw JSON)"
+      ansible.builtin.command: >-
         oc get namespace
         {{ node_roles | map(attribute='namespaces') | flatten | unique | join(' ') }}
-        -o custom-columns=NS:.metadata.name,SELECTOR:.metadata.annotations.openshift\.io/node-selector
-      register: ns_annotations
+        -o json
+      register: ns_annotations_raw
       changed_when: false
       tags: [always]
 
     - name: "WYNIK — namespace node-selector"
       ansible.builtin.debug:
-        msg: "{{ ns_annotations.stdout_lines }}"
+        msg: >-
+          {{ item.metadata.name }}
+          →  {{ item.metadata.annotations['openshift.io/node-selector'] | default('<brak>') }}
+      loop: "{{ (ns_annotations_raw.stdout | from_json).items }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
       tags: [always]
