@@ -203,6 +203,7 @@
         oc get mcp {{ node_roles | map(attribute='name') | join(' ') }}
       register: mcp_status
       changed_when: false
+      ignore_errors: true
       tags: [always]
 
     - name: "WYNIK — MachineConfigPools"
@@ -217,6 +218,7 @@
         -o json
       register: ns_annotations_raw
       changed_when: false
+      ignore_errors: true
       tags: [always]
 
     - name: "WYNIK — namespace node-selector"
@@ -227,4 +229,5 @@
       loop: "{{ (ns_annotations_raw.stdout | from_json).items }}"
       loop_control:
         label: "{{ item.metadata.name }}"
+      when: ns_annotations_raw is not failed
       tags: [always]
