@@ -1,0 +1,278 @@
+---
+# =============================================================================
+# ldap_sync_setup.yml
+# Playbook: Automatyczna synchronizacja grup LDAP z OpenShift
+#
+# Co robi:
+#   1. Tworzy ServiceAccount ldap-sync-sa w openshift-config
+#   2. Tworzy ClusterRole z uprawnieniami do zarządzania grupami OCP
+#   3. Tworzy ClusterRoleBinding (SA ↔ ClusterRole)
+#   4. Tworzy Secret z hasłem bind LDAP
+#   5. Tworzy ConfigMap z LDAPSyncConfig (hasło jako ref. do pliku, nie inline)
+#   6. Tworzy CronJob uruchamiający oc adm groups sync
+#   7. Weryfikuje utworzone zasoby
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   pip install kubernetes
+#
+# Uruchomienie:
+#   ansible-playbook ldap_sync_setup.yml
+#   ansible-playbook ldap_sync_setup.yml --check              # dry-run
+#   ansible-playbook ldap_sync_setup.yml --tags rbac          # tylko RBAC
+#   ansible-playbook ldap_sync_setup.yml --tags secret        # tylko Secret
+#   ansible-playbook ldap_sync_setup.yml --tags config        # tylko ConfigMap
+#   ansible-playbook ldap_sync_setup.yml --tags cronjob       # tylko CronJob
+#   ansible-playbook ldap_sync_setup.yml --tags run-now       # jednorazowy sync
+#
+# Hasło LDAP — zalecane szyfrowanie:
+#   ansible-vault encrypt_string 'hasło' --name ldap_bind_password >> vars/ldap_sync.yml
+#   ansible-playbook ldap_sync_setup.yml --ask-vault-pass
+#
+# Klaster wykrywany z aktywnej sesji oc (~/.kube/config).
+# Wymagane uprawnienia: cluster-admin
+# =============================================================================
+
+- name: "OpenShift — konfiguracja synchronizacji grup LDAP"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/ldap_sync.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Weryfikacja środowiska
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — aktywna sesja oc"
+      ansible.builtin.command: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+      tags: [always]
+
+    - name: "Weryfikacja — uprawnienia cluster-admin"
+      ansible.builtin.command: oc auth can-i '*' '*' --all-namespaces
+      register: can_admin
+      changed_when: false
+      failed_when: can_admin.stdout | trim != 'yes'
+      tags: [always]
+
+    - name: "INFO — konfiguracja synchronizacji LDAP"
+      ansible.builtin.debug:
+        msg:
+          - "Zalogowany jako    : {{ oc_user.stdout }}"
+          - "LDAP URL           : {{ ldap_sync_config.url }}"
+          - "Bind DN            : {{ ldap_sync_config.bindDN }}"
+          - "Base DN (users)    : {{ ldap_sync_config.activeDirectory.usersQuery.baseDN }}"
+          - "Namespace          : {{ ldap_namespace }}"
+          - "CronJob schedule   : {{ ldap_schedule }}"
+          - "Grup do mapowania  : {{ ldap_sync_config.groupUIDNameMapping | length }}"
+          - "Grupy              : {{ ldap_sync_config.groupUIDNameMapping.values() | list }}"
+      tags: [always]
+
+    # -------------------------------------------------------------------------
+    # 1. ServiceAccount
+    # -------------------------------------------------------------------------
+
+    - name: "ServiceAccount — {{ ldap_sa_name }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ ldap_sa_name }}"
+            namespace: "{{ ldap_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+      tags: [rbac]
+
+    # -------------------------------------------------------------------------
+    # 2. ClusterRole
+    # -------------------------------------------------------------------------
+
+    - name: "ClusterRole — ldap-group-sync (uprawnienia do grup OCP)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: ldap-group-sync
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          rules:
+            - apiGroups: ["user.openshift.io"]
+              resources: ["groups"]
+              verbs: ["get", "list", "create", "update", "patch", "delete"]
+      tags: [rbac]
+
+    # -------------------------------------------------------------------------
+    # 3. ClusterRoleBinding
+    # -------------------------------------------------------------------------
+
+    - name: "ClusterRoleBinding — {{ ldap_sa_name }} → ldap-group-sync"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: ldap-group-sync
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: ldap-group-sync
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ ldap_sa_name }}"
+              namespace: "{{ ldap_namespace }}"
+      tags: [rbac]
+
+    # -------------------------------------------------------------------------
+    # 4. Secret z hasłem bind LDAP
+    # -------------------------------------------------------------------------
+
+    - name: "Secret — {{ ldap_secret_name }} (hasło bind LDAP)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ldap_secret_name }}"
+            namespace: "{{ ldap_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          type: Opaque
+          stringData:
+            bindPassword: "{{ ldap_bind_password }}"
+      no_log: true
+      tags: [secret]
+
+    # -------------------------------------------------------------------------
+    # 5. ConfigMap z LDAPSyncConfig
+    #
+    # ldap_sync_config (dict z vars) konwertowany do YAML string przez to_nice_yaml.
+    # bindPassword w konfigu to referencja do pliku z Secretu — nie ma inline hasła.
+    # -------------------------------------------------------------------------
+
+    - name: "ConfigMap — {{ ldap_configmap_name }} (LDAPSyncConfig)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ ldap_configmap_name }}"
+            namespace: "{{ ldap_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          data:
+            ldap-group-sync.yaml: "{{ ldap_sync_config | to_nice_yaml(indent=2) }}"
+      tags: [config]
+
+    # -------------------------------------------------------------------------
+    # 6. CronJob
+    # -------------------------------------------------------------------------
+
+    - name: "CronJob — {{ ldap_cronjob_name }} (schedule: {{ ldap_schedule }})"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: "{{ ldap_cronjob_name }}"
+            namespace: "{{ ldap_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          spec:
+            schedule: "{{ ldap_schedule }}"
+            concurrencyPolicy: Forbid
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: "{{ ldap_sa_name }}"
+                    restartPolicy: OnFailure
+                    containers:
+                      - name: sync
+                        image: "{{ ldap_oc_image }}"
+                        command:
+                          - /bin/bash
+                          - -c
+                          - |
+                            oc adm groups sync \
+                              --sync-config=/config/ldap-group-sync.yaml \
+                              --confirm
+                        volumeMounts:
+                          - name: config
+                            mountPath: /config
+                          - name: ldap-secret
+                            mountPath: /ldap-secret
+                            readOnly: true
+                    volumes:
+                      - name: config
+                        configMap:
+                          name: "{{ ldap_configmap_name }}"
+                      - name: ldap-secret
+                        secret:
+                          secretName: "{{ ldap_secret_name }}"
+      tags: [cronjob]
+
+    # -------------------------------------------------------------------------
+    # 7. Jednorazowy sync (opcjonalny — --tags run-now)
+    # -------------------------------------------------------------------------
+
+    - name: "Job — jednorazowe uruchomienie synchronizacji"
+      ansible.builtin.command: >
+        oc create job ldap-sync-manual-{{ ansible_date_time.epoch }}
+        --from=cronjob/{{ ldap_cronjob_name }}
+        -n {{ ldap_namespace }}
+      register: manual_job
+      changed_when: manual_job.rc == 0
+      tags: [run-now, never]
+
+    - name: "INFO — uruchomiony job"
+      ansible.builtin.debug:
+        msg: "{{ manual_job.stdout }}"
+      tags: [run-now, never]
+
+    # -------------------------------------------------------------------------
+    # 8. Weryfikacja końcowa
+    # -------------------------------------------------------------------------
+
+    - name: "Weryfikacja — zasoby namespace'owe (SA, Secret, ConfigMap, CronJob)"
+      ansible.builtin.command: >
+        oc get sa,secret,configmap,cronjob
+        -n {{ ldap_namespace }}
+        -l app.kubernetes.io/managed-by=ansible
+        -o custom-columns=KIND:.kind,NAME:.metadata.name
+      register: ns_resources
+      changed_when: false
+      ignore_errors: true
+      tags: [always]
+
+    - name: "Weryfikacja — zasoby klastrowe (ClusterRole, ClusterRoleBinding)"
+      ansible.builtin.command: >
+        oc get clusterrole,clusterrolebinding
+        -l app.kubernetes.io/managed-by=ansible
+        -o custom-columns=KIND:.kind,NAME:.metadata.name
+      register: cluster_resources
+      changed_when: false
+      ignore_errors: true
+      tags: [always]
+
+    - name: "WYNIK — zasoby LDAP sync"
+      ansible.builtin.debug:
+        msg: "{{ ns_resources.stdout_lines + ['---'] + cluster_resources.stdout_lines }}"
+      tags: [always]

@@ -1,0 +1,61 @@
+---
+# vars/ldap_sync.yml
+# Konfiguracja automatycznej synchronizacji grup LDAP z OpenShift
+#
+# DOSTOSUJ PRZED URUCHOMIENIEM:
+#   - ldap_bind_password: użyj ansible-vault encrypt_string
+#   - ldap_sync_config: dostosuj URL, DN, mapowanie grup
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Hasło bind LDAP — zalecane: ansible-vault encrypt_string 'hasło' --name ldap_bind_password
+# ---------------------------------------------------------------------------
+ldap_bind_password: "your_bind_password"
+
+# ---------------------------------------------------------------------------
+# Zasoby Kubernetes
+# ---------------------------------------------------------------------------
+ldap_namespace: openshift-config
+ldap_sa_name: ldap-sync-sa
+ldap_secret_name: ldap-secret
+ldap_configmap_name: ldap-sync-config
+ldap_cronjob_name: ldap-group-sync
+ldap_oc_image: "registry.redhat.io/openshift4/ose-cli:latest"
+
+# ---------------------------------------------------------------------------
+# Harmonogram CronJob (składnia cron)
+# ---------------------------------------------------------------------------
+ldap_schedule: "0 6,18 * * *"    # 6:00 i 18:00 każdego dnia
+
+# ---------------------------------------------------------------------------
+# Konfiguracja LDAPSyncConfig — trafia bezpośrednio do ConfigMap
+#
+# bindPassword celowo NIE jest tutaj — hasło podawane jest przez Secret
+# montowany jako plik /ldap-secret/bindPassword (patrz ldap_bind_password)
+#
+# groupUIDNameMapping:
+#   klucz   = DN grupy w LDAP
+#   wartość = nazwa grupy w OpenShift (zostanie utworzona przy sync)
+# ---------------------------------------------------------------------------
+ldap_sync_config:
+  kind: LDAPSyncConfig
+  apiVersion: v1
+  url: "ldaps://ldaps.example.com"             # <-- adres serwera LDAP
+  bindDN: "cn=admin,dc=acme,dc=com"            # <-- konto service account LDAP
+  bindPassword:
+    file: /ldap-secret/bindPassword            # referencja do Secretu (nie zmieniać)
+  insecure: false                              # true = wyłącz weryfikację TLS (niezalecane)
+  groupUIDNameMapping:                         # <-- mapowanie DN grupy LDAP → nazwa w OCP
+    "CN=ROLE_ocp4_prod,ou=users,dc=acme,dc=com": ocp4-prod-users
+    "CN=ROLE_ocp4_prodadmin,ou=users,dc=acme,dc=com": ocp4-prod-admins
+  activeDirectory:
+    usersQuery:
+      baseDN: "ou=users,dc=acme,dc=com"        # <-- base DN dla użytkowników
+      scope: sub                               # base | one | sub
+      derefAliases: never                      # never | always | search | finding
+      pageSize: 0                              # 0 = bez paginacji
+      filter: "(objectClass=person)"           # filtr LDAP dla użytkowników
+    userNameAttributes:
+      - sAMAccountName                         # <-- atrybut LDAP jako login OCP
+    groupMembershipAttributes:
+      - memberOf                               # <-- atrybut wskazujący przynależność do grup
