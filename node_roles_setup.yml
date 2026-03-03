@@ -99,9 +99,18 @@
       loop: "{{ node_roles | subelements('namespaces') }}"
       loop_control:
         label: "[{{ item.0.name }}] namespace/{{ item.1 }}"
-      register: ns_check
+      register: ns_existence
       changed_when: false
-      failed_when: ns_check.rc != 0
+      failed_when: false
+      tags: [always, namespace]
+
+    - name: "INFO — namespace'y które zostaną utworzone"
+      ansible.builtin.debug:
+        msg: "Namespace '{{ item.item.1 }}' nie istnieje — zostanie utworzony z annotations"
+      loop: "{{ ns_existence.results }}"
+      loop_control:
+        label: "{{ item.item.1 }}"
+      when: item.rc != 0
       tags: [always, namespace]
 
     # -------------------------------------------------------------------------
@@ -210,7 +219,7 @@
     #   Dzięki temu pody z tych NS tolerują taint na nodach bez zmian w deployment.
     # -------------------------------------------------------------------------
 
-    - name: "Namespace — node-selector + toleration (twarda izolacja)"
+    - name: "Namespace — tworzenie/aktualizacja z node-selector + toleration (twarda izolacja)"
       kubernetes.core.k8s:
         state: present
         api_version: v1
@@ -218,6 +227,8 @@
         name: "{{ item.1 }}"
         definition:
           metadata:
+            labels:
+              app.kubernetes.io/managed-by: ansible
             annotations:
               openshift.io/node-selector: "node-role.kubernetes.io/{{ item.0.name }}="
               scheduler.alpha.kubernetes.io/tolerations: >-
@@ -231,7 +242,7 @@
       when: item.0.taint.enabled | default(false)
       tags: [namespace]
 
-    - name: "Namespace — tylko node-selector (bez taintu)"
+    - name: "Namespace — tworzenie/aktualizacja z node-selector (bez taintu)"
       kubernetes.core.k8s:
         state: present
         api_version: v1
@@ -239,6 +250,8 @@
         name: "{{ item.1 }}"
         definition:
           metadata:
+            labels:
+              app.kubernetes.io/managed-by: ansible
             annotations:
               openshift.io/node-selector: "node-role.kubernetes.io/{{ item.0.name }}="
       loop: "{{ node_roles | subelements('namespaces') }}"
