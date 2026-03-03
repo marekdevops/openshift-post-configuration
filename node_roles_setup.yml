@@ -104,14 +104,36 @@
       failed_when: false
       tags: [always, namespace]
 
-    - name: "INFO — namespace'y które zostaną utworzone"
-      ansible.builtin.debug:
-        msg: "Namespace '{{ item.item.1 }}' nie istnieje — zostanie utworzony z annotations"
-      loop: "{{ ns_existence.results }}"
+    - name: "Oblicz czy wszystkie namespace'y roli są gotowe"
+      # ns_ready_map[<role_name>] = true  → wszystkie NS istnieją → faza 2 (taint + annotations)
+      # ns_ready_map[<role_name>] = false → brakuje NS          → faza 1 (tylko label + MCP)
+      ansible.builtin.set_fact:
+        ns_ready_map: >-
+          {{ ns_ready_map | default({}) | combine({
+               item.name: (ns_existence.results
+                           | selectattr('item.0.name', 'equalto', item.name)
+                           | selectattr('rc', 'ne', 0)
+                           | list | length == 0)
+             }) }}
+      loop: "{{ node_roles }}"
       loop_control:
-        label: "{{ item.item.1 }}"
-      when: item.rc != 0
-      tags: [always, namespace]
+        label: "{{ item.name }}"
+      tags: [always, namespace, taint]
+
+    - name: "INFO — faza konfiguracji per rola"
+      ansible.builtin.debug:
+        msg: >-
+          Rola '{{ item.name }}':
+          {% if ns_ready_map[item.name] %}
+          FAZA 2 — wszystkie namespace'y istnieją → taint + annotations
+          {% else %}
+          FAZA 1 — brakuje namespace'ów → tylko label + MCP (bez taintu)
+          Uruchom playbook ponownie gdy NS będą gotowe.
+          {% endif %}
+      loop: "{{ node_roles }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [always, namespace, taint]
 
     # -------------------------------------------------------------------------
     # 2. Etykietowanie nodów
@@ -164,7 +186,9 @@
       loop: "{{ node_roles | subelements('nodes') }}"
       loop_control:
         label: "taint {{ item.0.taint.key }}={{ item.0.taint.value }}:{{ item.0.taint.effect }} → {{ item.1 }}"
-      when: item.0.taint.enabled | default(false)
+      when:
+        - item.0.taint.enabled | default(false)
+        - ns_ready_map[item.0.name] | bool
       register: taint_result
       changed_when: "'tainted' in taint_result.stdout"
       tags: [taint]
@@ -219,7 +243,8 @@
     #   Dzięki temu pody z tych NS tolerują taint na nodach bez zmian w deployment.
     # -------------------------------------------------------------------------
 
-    - name: "Namespace — tworzenie/aktualizacja z node-selector + toleration (twarda izolacja)"
+    - name: "Namespace — annotations z node-selector + toleration (twarda izolacja)"
+      # Uruchamiane tylko gdy wszystkie NS roli istnieją (faza 2)
       kubernetes.core.k8s:
         state: present
         api_version: v1
@@ -239,10 +264,13 @@
       loop: "{{ node_roles | subelements('namespaces') }}"
       loop_control:
         label: "namespace/{{ item.1 }} → {{ item.0.name }}"
-      when: item.0.taint.enabled | default(false)
+      when:
+        - item.0.taint.enabled | default(false)
+        - ns_ready_map[item.0.name] | bool
       tags: [namespace]
 
-    - name: "Namespace — tworzenie/aktualizacja z node-selector (bez taintu)"
+    - name: "Namespace — annotations z node-selector (bez taintu)"
+      # Uruchamiane tylko gdy wszystkie NS roli istnieją (faza 2)
       kubernetes.core.k8s:
         state: present
         api_version: v1
@@ -257,7 +285,9 @@
       loop: "{{ node_roles | subelements('namespaces') }}"
       loop_control:
         label: "namespace/{{ item.1 }} → {{ item.0.name }}"
-      when: not (item.0.taint.enabled | default(false))
+      when:
+        - not (item.0.taint.enabled | default(false))
+        - ns_ready_map[item.0.name] | bool
       tags: [namespace]
 
     # -------------------------------------------------------------------------
