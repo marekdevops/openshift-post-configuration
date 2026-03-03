@@ -12,43 +12,66 @@
 #     nodes                   — lista nazw nodów (oc get nodes -o name)
 #     namespaces              — NS których pody mają trafiać na te nody
 #                               annotation openshift.io/node-selector zostanie ustawiona
+#                               annotation scheduler.alpha.kubernetes.io/tolerations
+#                               wstrzykuje toleration do każdego poda automatycznie
+#                               (via admission plugin PodTolerationRestriction)
+#     taint                   — konfiguracja taintu (twarda izolacja)
+#       enabled               — true = nody dostaną taint, tylko pody z tolerationem wejdą
+#       key                   — klucz taintu (np. "dedicated")
+#       value                 — wartość taintu (np. "worker-priority")
+#       effect                — NoSchedule | PreferNoSchedule | NoExecute
 #     mcp                     — konfiguracja MachineConfigPool
 #       max_unavailable       — ile nodów naraz aktualizować (int lub procent "33%")
 #       inherit_roles         — role MC do dziedziczenia (zwykle [worker])
-#                               nody dostaną konfigurację OS/kubelet jak worker + własne MC
+#
+# IZOLACJA TWARDA (taint: enabled: true):
+#   Node:      taint dedicated=worker-priority:NoSchedule
+#   Namespace: openshift.io/node-selector          → pody idą TYLKO na te nody
+#              scheduler.alpha.kubernetes.io/tolerations → pody automatycznie
+#                                                          dostają toleration
+#   Efekt:     pody z innych NS nie mają tolerationa → taint je blokuje
+#              pody z dedykowanych NS mają toleration → wchodzą na te nody
 #
 # DODAWANIE NOWEJ ROLI:
-#   Skopiuj blok "- name: high-performance" poniżej i dostosuj.
+#   Skopiuj blok poniżej i dostosuj.
 #   Playbook node_roles_setup.yml obsłuży wszystko automatycznie.
 #
 # UWAGA — kolejność MCP podczas aktualizacji klastra:
-#   OpenShift aktualizuje: master → custom pools (równolegle) → worker
-#   Aby priority pool aktualizował się PRZED workerami:
+#   OpenShift aktualizuje: master → custom MCP (równolegle) → worker
+#   Aby worker-priority aktualizował się PRZED zwykłymi workerami:
 #     oc patch mcp worker --type merge -p '{"spec":{"paused":true}}'
-#   Po zakończeniu priority pool:
+#   Po zakończeniu worker-priority:
 #     oc patch mcp worker --type merge -p '{"spec":{"paused":false}}'
 # ---------------------------------------------------------------------------
 
 node_roles:
 
-  - name: high-performance
-    description: "Nody dedykowane dla krytycznych aplikacji produkcyjnych"
+  - name: worker-priority
+    description: "Dedykowane nody dla krytycznych aplikacji — twarda izolacja"
     remove_worker_role: true   # nody należą TYLKO do tej puli MCP
 
     nodes:
-      - worker-node-1.example.com   # <-- zmień na rzeczywiste nazwy nodów
-      - worker-node-2.example.com   # oc get nodes -o name
-      - worker-node-3.example.com
-      - worker-node-4.example.com
+      - worker-priority-1.example.com   # <-- zmień na rzeczywiste nazwy nodów
+      - worker-priority-2.example.com   # oc get nodes -o name
+      - worker-priority-3.example.com
+      - worker-priority-4.example.com
+      - worker-priority-5.example.com
 
     namespaces:
-      - xyz    # <-- NS których pody mają schedulować się na te nody
-      - abc
+      - app-critical-1    # <-- NS których pody mają schedulować się na te nody
+      - app-critical-2
+      - app-critical-3
+
+    taint:
+      enabled: true
+      key: dedicated
+      value: worker-priority
+      effect: NoSchedule    # blokuje pody bez tolerationa (twarda izolacja)
 
     mcp:
-      max_unavailable: 1      # ile nodów naraz idzie w aktualizację
-      inherit_roles:          # MC z tych ról będą aplikowane (OS config, kubelet)
-        - worker              # dziedziczy pełną konfigurację worker nodów
+      max_unavailable: 1      # konserwatywnie — po jednym nodzie naraz
+      inherit_roles:
+        - worker              # dziedziczy konfigurację OS/kubelet z worker pool
 
 
   # ---------------------------------------------------------------------------
@@ -65,6 +88,12 @@ node_roles:
   #   namespaces:
   #     - ml-project
   #     - data-science
+  #
+  #   taint:
+  #     enabled: true
+  #     key: dedicated
+  #     value: gpu-workers
+  #     effect: NoSchedule
   #
   #   mcp:
   #     max_unavailable: 1

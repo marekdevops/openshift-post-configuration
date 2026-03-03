@@ -1,15 +1,19 @@
 ---
 # =============================================================================
 # node_roles_setup.yml
-# Playbook: Tworzenie custom ról nodów w OpenShift
+# Playbook: Tworzenie custom ról nodów w OpenShift z opcjonalną twardą izolacją
 #
 # Co robi (dla każdej roli z vars/node_roles.yml):
-#   1. Weryfikuje że wskazane nody istnieją w klastrze
+#   1. Weryfikuje że wskazane nody i namespace'y istnieją w klastrze
 #   2. Nadaje nodom etykietę node-role.kubernetes.io/<name>
 #   3. Opcjonalnie usuwa etykietę node-role.kubernetes.io/worker
-#   4. Tworzy MachineConfigPool dziedziczący konfigurację z worker
-#   5. Ustawia annotation openshift.io/node-selector na wskazanych namespace'ach
-#   6. Weryfikuje wynik
+#   4. Opcjonalnie nakłada taint (twarda izolacja: dedicated=<name>:NoSchedule)
+#   5. Tworzy MachineConfigPool dziedziczący konfigurację z worker
+#   6. Ustawia namespace annotations:
+#      - openshift.io/node-selector          (pody idą TYLKO na te nody)
+#      - scheduler.alpha.kubernetes.io/tolerations  (automatyczny toleration
+#        dla każdego poda via PodTolerationRestriction admission plugin)
+#   7. Weryfikuje wynik: taints, etykiety, MCP, namespace annotations
 #
 # Wymagania:
 #   ansible-galaxy collection install kubernetes.core
@@ -17,10 +21,12 @@
 #
 # Uruchomienie:
 #   ansible-playbook node_roles_setup.yml
-#   ansible-playbook node_roles_setup.yml --check          # dry-run
-#   ansible-playbook node_roles_setup.yml --tags label     # tylko labelowanie
-#   ansible-playbook node_roles_setup.yml --tags mcp       # tylko MCP
-#   ansible-playbook node_roles_setup.yml --tags namespace # tylko NS
+#   ansible-playbook node_roles_setup.yml --check             # dry-run
+#   ansible-playbook node_roles_setup.yml --tags label        # tylko labelowanie
+#   ansible-playbook node_roles_setup.yml --tags taint        # tylko tainty
+#   ansible-playbook node_roles_setup.yml --tags mcp          # tylko MCP
+#   ansible-playbook node_roles_setup.yml --tags namespace    # tylko NS annotations
+#   ansible-playbook node_roles_setup.yml --tags verify       # tylko weryfikacja
 #
 # Klaster wykrywany z aktywnej sesji oc (~/.kube/config).
 # Wymagane uprawnienia: cluster-admin
@@ -67,13 +73,15 @@
           — namespace'y: {{ item.namespaces | join(', ') }}
           — MCP max_unavailable: {{ item.mcp.max_unavailable }}
           — usuń rolę worker: {{ item.remove_worker_role | default(false) }}
+          — taint: {{ item.taint.key + '=' + item.taint.value + ':' + item.taint.effect
+             if item.taint.enabled | default(false) else 'wyłączony' }}
       loop: "{{ node_roles }}"
       loop_control:
         label: "{{ item.name }}"
       tags: [always]
 
     # -------------------------------------------------------------------------
-    # 1. Weryfikacja istnienia nodów
+    # 1. Weryfikacja istnienia nodów i namespace'ów
     # -------------------------------------------------------------------------
 
     - name: "Weryfikacja — sprawdzenie czy wskazane nody istnieją"
@@ -84,7 +92,17 @@
       register: node_check
       changed_when: false
       failed_when: node_check.rc != 0
-      tags: [always, label]
+      tags: [always, label, taint]
+
+    - name: "Weryfikacja — sprawdzenie czy wskazane namespace'y istnieją"
+      ansible.builtin.command: oc get namespace {{ item.1 }}
+      loop: "{{ node_roles | subelements('namespaces') }}"
+      loop_control:
+        label: "[{{ item.0.name }}] namespace/{{ item.1 }}"
+      register: ns_check
+      changed_when: false
+      failed_when: ns_check.rc != 0
+      tags: [always, namespace]
 
     # -------------------------------------------------------------------------
     # 2. Etykietowanie nodów
@@ -114,11 +132,36 @@
         label: "remove worker role → {{ item.1 }}"
       when: item.0.remove_worker_role | default(false)
       register: remove_worker_label
-      changed_when: "'labeled' in remove_worker_label.stdout or 'unlabeled' in remove_worker_label.stdout"
+      changed_when: >-
+        'labeled' in remove_worker_label.stdout
+        or 'unlabeled' in remove_worker_label.stdout
       tags: [label]
 
     # -------------------------------------------------------------------------
-    # 3. MachineConfigPool
+    # 3. Taint nodów (twarda izolacja)
+    #
+    # Efekt: tylko pody z matching tolerationem mogą być zaschedulowane
+    # na tych nodach. Pody bez tolerationa są blokowane przez scheduler.
+    #
+    # Admission plugin PodTolerationRestriction automatycznie wstrzykuje
+    # toleration do podów w dedykowanych namespace'ach (sekcja 4 poniżej).
+    # -------------------------------------------------------------------------
+
+    - name: "Taint — nakładanie {{ item.0.taint.key }}={{ item.0.taint.value }}:{{ item.0.taint.effect }}"
+      ansible.builtin.command: >
+        oc adm taint node {{ item.1 }}
+        {{ item.0.taint.key }}={{ item.0.taint.value }}:{{ item.0.taint.effect }}
+        --overwrite
+      loop: "{{ node_roles | subelements('nodes') }}"
+      loop_control:
+        label: "taint {{ item.0.taint.key }}={{ item.0.taint.value }}:{{ item.0.taint.effect }} → {{ item.1 }}"
+      when: item.0.taint.enabled | default(false)
+      register: taint_result
+      changed_when: "'tainted' in taint_result.stdout"
+      tags: [taint]
+
+    # -------------------------------------------------------------------------
+    # 4. MachineConfigPool
     # -------------------------------------------------------------------------
 
     - name: "MachineConfigPool — tworzenie puli dla roli {{ item.name }}"
@@ -146,27 +189,28 @@
 
             # Ile nodów może być jednocześnie w trakcie aktualizacji
             # Można podać liczbę (1, 2) lub procent ("33%")
-            maxUnavailable: "{{ item.mcp.max_unavailable if '%' in (item.mcp.max_unavailable | string) else (item.mcp.max_unavailable | int) }}"
+            maxUnavailable: >-
+              {{ item.mcp.max_unavailable
+                 if '%' in (item.mcp.max_unavailable | string)
+                 else (item.mcp.max_unavailable | int) }}
       loop: "{{ node_roles }}"
       loop_control:
         label: "MachineConfigPool/{{ item.name }}"
       tags: [mcp]
 
     # -------------------------------------------------------------------------
-    # 4. Namespace annotations
+    # 5. Namespace annotations
+    #
+    # openshift.io/node-selector:
+    #   Wymusza node-selector na wszystkich podach — pody idą TYLKO na te nody.
+    #
+    # scheduler.alpha.kubernetes.io/tolerations:
+    #   OCP admission plugin PodTolerationRestriction czyta tę annotation
+    #   i wstrzykuje toleration do każdego poda w tym namespace automatycznie.
+    #   Dzięki temu pody z tych NS tolerują taint na nodach bez zmian w deployment.
     # -------------------------------------------------------------------------
 
-    - name: "Weryfikacja — sprawdzenie czy wskazane namespace'y istnieją"
-      ansible.builtin.command: oc get namespace {{ item.1 }}
-      loop: "{{ node_roles | subelements('namespaces') }}"
-      loop_control:
-        label: "[{{ item.0.name }}] namespace/{{ item.1 }}"
-      register: ns_check
-      changed_when: false
-      failed_when: ns_check.rc != 0
-      tags: [namespace]
-
-    - name: "Namespace — ustawienie openshift.io/node-selector"
+    - name: "Namespace — node-selector + toleration (twarda izolacja)"
       kubernetes.core.k8s:
         state: present
         api_version: v1
@@ -175,28 +219,56 @@
         definition:
           metadata:
             annotations:
-              # Wymusza node-selector na wszystkich podach w tym namespace
-              # Pody bez zgodnego nodeSelector nie zostaną zaschedulowane
+              openshift.io/node-selector: "node-role.kubernetes.io/{{ item.0.name }}="
+              scheduler.alpha.kubernetes.io/tolerations: >-
+                {{ [{'key': item.0.taint.key,
+                     'operator': 'Equal',
+                     'value': item.0.taint.value,
+                     'effect': item.0.taint.effect}] | to_json }}
+      loop: "{{ node_roles | subelements('namespaces') }}"
+      loop_control:
+        label: "namespace/{{ item.1 }} → {{ item.0.name }}"
+      when: item.0.taint.enabled | default(false)
+      tags: [namespace]
+
+    - name: "Namespace — tylko node-selector (bez taintu)"
+      kubernetes.core.k8s:
+        state: present
+        api_version: v1
+        kind: Namespace
+        name: "{{ item.1 }}"
+        definition:
+          metadata:
+            annotations:
               openshift.io/node-selector: "node-role.kubernetes.io/{{ item.0.name }}="
       loop: "{{ node_roles | subelements('namespaces') }}"
       loop_control:
-        label: "namespace/{{ item.1 }} → node-role.kubernetes.io/{{ item.0.name }}"
+        label: "namespace/{{ item.1 }} → {{ item.0.name }}"
+      when: not (item.0.taint.enabled | default(false))
       tags: [namespace]
 
     # -------------------------------------------------------------------------
-    # 5. Weryfikacja końcowa
+    # 6. Weryfikacja końcowa
     # -------------------------------------------------------------------------
 
-    - name: "Weryfikacja — etykiety na nodach"
+    - name: "Weryfikacja — taints na nodach"
       ansible.builtin.command: >
         oc get nodes -l node-role.kubernetes.io/{{ item.name }}
-        -o custom-columns=NODE:.metadata.name,ROLES:.metadata.labels
+        -o custom-columns=NODE:.metadata.name,TAINTS:.spec.taints
       loop: "{{ node_roles }}"
       loop_control:
         label: "rola: {{ item.name }}"
-      register: node_labels_check
+      register: node_taints_check
       changed_when: false
-      tags: [always]
+      tags: [always, verify]
+
+    - name: "WYNIK — taints na nodach"
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ node_taints_check.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: [always, verify]
 
     - name: "Weryfikacja — stan MachineConfigPools"
       ansible.builtin.command: >
@@ -204,14 +276,14 @@
       register: mcp_status
       changed_when: false
       ignore_errors: true
-      tags: [always]
+      tags: [always, verify]
 
     - name: "WYNIK — MachineConfigPools"
       ansible.builtin.debug:
         msg: "{{ mcp_status.stdout_lines }}"
-      tags: [always]
+      tags: [always, verify]
 
-    - name: "WYNIK — namespace annotations (raw JSON)"
+    - name: "Weryfikacja — namespace annotations (raw JSON)"
       ansible.builtin.command: >-
         oc get namespace
         {{ node_roles | map(attribute='namespaces') | flatten | unique | join(' ') }}
@@ -219,15 +291,16 @@
       register: ns_annotations_raw
       changed_when: false
       ignore_errors: true
-      tags: [always]
+      tags: [always, verify]
 
-    - name: "WYNIK — namespace node-selector"
+    - name: "WYNIK — namespace node-selector i toleration"
       ansible.builtin.debug:
-        msg: >-
-          {{ item.metadata.name }}
-          →  {{ item.metadata.annotations['openshift.io/node-selector'] | default('<brak>') }}
+        msg:
+          - "NS: {{ item.metadata.name }}"
+          - "node-selector : {{ item.metadata.annotations['openshift.io/node-selector'] | default('<brak>') }}"
+          - "tolerations   : {{ item.metadata.annotations['scheduler.alpha.kubernetes.io/tolerations'] | default('<brak>') }}"
       loop: "{{ (ns_annotations_raw.stdout | from_json)['items'] }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       when: ns_annotations_raw is not failed
-      tags: [always]
+      tags: [always, verify]
