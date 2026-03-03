@@ -1,0 +1,206 @@
+---
+# =============================================================================
+# OCP Zabbix Monitoring Setup
+# =============================================================================
+# Tworzy ServiceAccount, ClusterRoleBinding i nie wygasajacy token
+# dla zewnetrznego Zabbixa, ktory queruje Thanos Querier przez Prometheusa.
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   Zalogowany uzytkownik z prawem do tworzenia ClusterRoleBinding
+#
+# Uzycie:
+#   ansible-playbook playbook.yml
+#   ansible-playbook playbook.yml -e validate_certs=true
+# =============================================================================
+
+- name: OCP - Setup Zabbix Monitoring Reader Access
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    sa_name: zabbix-monitoring-reader
+    namespace: openshift-monitoring
+    secret_name: zabbix-monitoring-reader-token
+    crb_name: zabbix-monitoring-view
+    validate_certs: false
+    output_file: "{{ playbook_dir }}/zabbix-ocp-credentials.env"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. ServiceAccount
+    # -------------------------------------------------------------------------
+    - name: "[1/7] Tworzenie ServiceAccount"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ sa_name }}"
+            namespace: "{{ namespace }}"
+            labels:
+              app: zabbix-monitoring
+              managed-by: ansible
+
+    # -------------------------------------------------------------------------
+    # 2. ClusterRoleBinding - tylko odczyt metryk klastra
+    # -------------------------------------------------------------------------
+    - name: "[2/7] Nadawanie roli cluster-monitoring-view"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "{{ crb_name }}"
+            labels:
+              app: zabbix-monitoring
+              managed-by: ansible
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-monitoring-view
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ sa_name }}"
+              namespace: "{{ namespace }}"
+
+    # -------------------------------------------------------------------------
+    # 3. Secret typu service-account-token - nie wygasa (legacy SA token)
+    # -------------------------------------------------------------------------
+    - name: "[3/7] Tworzenie nie-wygasajacego tokenu (Secret SA)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ secret_name }}"
+            namespace: "{{ namespace }}"
+            annotations:
+              kubernetes.io/service-account.name: "{{ sa_name }}"
+            labels:
+              app: zabbix-monitoring
+              managed-by: ansible
+          type: kubernetes.io/service-account-token
+
+    # -------------------------------------------------------------------------
+    # 4. Czekaj az kontroler OCP wypelni token w Secret
+    # -------------------------------------------------------------------------
+    - name: "[4/7] Oczekiwanie na wypelnienie tokenu przez OCP (max 60s)"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ secret_name }}"
+        namespace: "{{ namespace }}"
+      register: token_secret
+      until:
+        - token_secret.resources | length > 0
+        - token_secret.resources[0].data is defined
+        - token_secret.resources[0].data.token is defined
+      retries: 12
+      delay: 5
+
+    - name: Dekodowanie tokenu z base64
+      ansible.builtin.set_fact:
+        bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
+
+    # -------------------------------------------------------------------------
+    # 5. Pobierz Route Thanos Querier
+    # -------------------------------------------------------------------------
+    - name: "[5/7] Pobieranie Route Thanos Querier"
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: thanos-querier
+        namespace: "{{ namespace }}"
+      register: thanos_route
+
+    - name: Weryfikacja istnienia Route
+      ansible.builtin.fail:
+        msg: >
+          Nie znaleziono Route 'thanos-querier' w namespace '{{ namespace }}'.
+          Upewnij sie ze monitoring klastrowy jest wlaczony.
+      when: thanos_route.resources | length == 0
+
+    - name: Ustawienie URL Thanos Querier
+      ansible.builtin.set_fact:
+        thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
+
+    # -------------------------------------------------------------------------
+    # 6. Test polaczenia - query cluster_operator_conditions
+    # -------------------------------------------------------------------------
+    - name: "[6/7] Test polaczenia - cluster_operator_conditions{condition='Available'}"
+      ansible.builtin.uri:
+        url: "{{ thanos_url }}/api/v1/query"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ bearer_token }}"
+        body_format: form-urlencoded
+        body:
+          query: 'cluster_operator_conditions{condition="Available"}'
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+        timeout: 30
+      register: test_result
+
+    - name: Zliczanie operatorow z odpowiedzi
+      ansible.builtin.set_fact:
+        operator_count: "{{ test_result.json.data.result | length }}"
+        operators_ok: >-
+          {{
+            test_result.json.data.result
+            | selectattr('value', 'defined')
+            | map(attribute='metric.name')
+            | list
+            | sort
+          }}
+
+    # -------------------------------------------------------------------------
+    # 7. Wyswietl wyniki i zapisz credentials
+    # -------------------------------------------------------------------------
+    - name: "[7/7] Zapisywanie credentials do pliku {{ output_file }}"
+      ansible.builtin.copy:
+        content: |
+          # ============================================================
+          # Zabbix OCP Monitoring Credentials
+          # Wygenerowano: {{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S"') }}
+          # ServiceAccount : {{ sa_name }}
+          # Namespace      : {{ namespace }}
+          # ClusterRole    : cluster-monitoring-view (READ-ONLY)
+          # Token type     : kubernetes.io/service-account-token (nie wygasa)
+          # ============================================================
+
+          THANOS_URL={{ thanos_url }}
+          BEARER_TOKEN={{ bearer_token }}
+
+          # Przykladowe zapytanie curl:
+          # curl -sk -H "Authorization: Bearer $BEARER_TOKEN" \
+          #   "$THANOS_URL/api/v1/query?query=cluster_operator_conditions{condition=\"Available\"}"
+
+          # Przykladowe zapytanie Zabbix HTTP Agent:
+          # URL    : {{ thanos_url }}/api/v1/query?query=cluster_operator_conditions%7Bcondition%3D%22Available%22%7D
+          # Header : Authorization: Bearer {{ bearer_token }}
+          # JSONPath preprocessing: $.data.result[0].value[1]
+        dest: "{{ output_file }}"
+        mode: '0600'
+
+    - name: Podsumowanie
+      ansible.builtin.debug:
+        msg:
+          - "======================================================"
+          - "  KONFIGURACJA ZAKONCZONA POMYSLNIE"
+          - "======================================================"
+          - "Thanos Querier URL : {{ thanos_url }}"
+          - "Credentials zapisano: {{ output_file }}"
+          - "Test query HTTP    : {{ test_result.status }}"
+          - "Operatorow w odpowiedzi: {{ operator_count }}"
+          - "------------------------------------------------------"
+          - "Operatory (Available=1):"
+          - "{{ operators_ok | join(', ') }}"
+          - "======================================================"
+          - "UWAGA: Plik .env zawiera token - chron go jak haslo!"
+          - "======================================================"
