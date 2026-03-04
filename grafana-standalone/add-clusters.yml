@@ -6,21 +6,19 @@
 #   1. Zaloguj sie do klastra:   oc login https://api.klaster.example.com ...
 #   2. Odpal playbook:           ansible-playbook add-clusters.yml \
 #                                  -i inventory/hosts.ini \
-#                                  -e cluster_name=prod \
-#                                  --ask-become-pass
+#                                  -e cluster_name=prod
 #
-# cluster_name to nazwa ktora pojawi sie w dropdown Grafany ("OCP - prod")
+# Playbook wygeneruje plik datasource na bastionie w katalogu ./generated/
+# Nastepnie skopiuj go recznie na hosta Grafany (instrukcja na koncu).
 # =============================================================================
 
-# =============================================================================
-# PLAY 1 — bastion: Pobierz dane z aktualnie zalogowanego klastra OCP
-# =============================================================================
-- name: "Play 1/2 — Pobieranie danych z klastra OCP"
+- name: "Pobieranie danych z klastra OCP i generowanie datasource"
   hosts: bastion
   gather_facts: false
   vars:
     monitoring_namespace: openshift-monitoring
     validate_certs: false
+    output_dir: "{{ playbook_dir }}/generated"
 
   tasks:
 
@@ -28,7 +26,7 @@
       ansible.builtin.fail:
         msg: |
           Brak wymaganej zmiennej cluster_name.
-          Uzycie: ansible-playbook add-clusters.yml -i inventory/hosts.ini -e cluster_name=prod --ask-become-pass
+          Uzycie: ansible-playbook add-clusters.yml -i inventory/hosts.ini -e cluster_name=prod
       when: cluster_name is not defined or cluster_name == ""
 
     - name: Sprawdzenie aktywnego logowania OCP (oc whoami)
@@ -47,8 +45,8 @@
     - name: "Potwierdzenie kontekstu"
       ansible.builtin.debug:
         msg:
-          - "Klaster  : {{ cluster_name }}"
-          - "API URL  : {{ oc_server.stdout }}"
+          - "Klaster   : {{ cluster_name }}"
+          - "API URL   : {{ oc_server.stdout }}"
           - "Uzytkownik: {{ oc_whoami.stdout }}"
 
     # -------------------------------------------------------------------------
@@ -132,7 +130,7 @@
     # -------------------------------------------------------------------------
     # Test polaczenia
     # -------------------------------------------------------------------------
-    - name: "Test polaczenia z Thanos Querier"
+    - name: Test polaczenia z Thanos Querier
       ansible.builtin.uri:
         url: "https://{{ thanos_route.resources[0].spec.host }}/api/v1/query"
         method: POST
@@ -147,75 +145,46 @@
         timeout: 30
       register: test_result
 
-    - name: "Wynik testu — operatorow w klastrze: {{ test_result.json.data.result | length }}"
+    - name: "Test OK — operatorow w klastrze: {{ test_result.json.data.result | length }}"
       ansible.builtin.debug:
         msg: "Thanos Querier odpowiada. Operatorow: {{ test_result.json.data.result | length }}"
 
     # -------------------------------------------------------------------------
-    # Zapisz dane do przekazania do Play 2
+    # Generowanie pliku datasource lokalnie na bastionie
     # -------------------------------------------------------------------------
-    - name: Zapisanie danych datasource jako fact
-      ansible.builtin.set_fact:
-        cluster_datasources:
-          - name: "{{ cluster_name }}"
-            thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
-            bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
-            operators_count: "{{ test_result.json.data.result | length }}"
+    - name: Tworzenie katalogu generated/
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0700'
 
-# =============================================================================
-# PLAY 2 — grafana host: Zapisz datasource i przeladuj Grafane
-# =============================================================================
-- name: "Play 2/2 — Provisioning datasource na hoscie Grafany"
-  hosts: grafana
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/clusters.yml
-  vars:
-    cluster_datasources: "{{ hostvars[groups['bastion'][0]]['cluster_datasources'] }}"
-
-  handlers:
-    - name: reload grafana
-      ansible.builtin.systemd:
-        name: grafana-server
-        state: reloaded
-
-  tasks:
-
-    - name: Sprawdzenie czy Grafana dziala
-      ansible.builtin.systemd:
-        name: grafana-server
-      register: grafana_svc
-      failed_when: grafana_svc.status.ActiveState != "active"
-
-    - name: "Zapis datasource: OCP - {{ ds.name }}"
+    - name: "Generowanie pliku datasource — generated/ocp-{{ cluster_name }}.yml"
       ansible.builtin.template:
         src: templates/datasource.yml.j2
-        dest: "/etc/grafana/provisioning/datasources/ocp-{{ ds.name }}.yml"
-        owner: grafana
-        group: grafana
-        mode: '0640'
-      loop: "{{ cluster_datasources }}"
-      loop_control:
-        loop_var: ds
-        label: "{{ ds.name }}"
-      notify: reload grafana
+        dest: "{{ output_dir }}/ocp-{{ cluster_name }}.yml"
+        mode: '0600'
+      vars:
+        ds:
+          name: "{{ cluster_name }}"
+          thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
+          bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
 
-    - name: Wymuszenie przeladowania Grafany
-      ansible.builtin.meta: flush_handlers
-
-    - name: Oczekiwanie az Grafana odpowie po reload
-      ansible.builtin.wait_for:
-        host: localhost
-        port: "{{ grafana_port }}"
-        delay: 5
-        timeout: 30
-
-    - name: "============ GOTOWE ============"
+    # -------------------------------------------------------------------------
+    # Instrukcja co zrobic dalej
+    # -------------------------------------------------------------------------
+    - name: "============ GOTOWE — CO TERAZ ============"
       ansible.builtin.debug:
         msg:
-          - "================================================"
-          - "  Dodano datasource: OCP - {{ cluster_datasources[0].name }}"
-          - "  Operatorow       : {{ cluster_datasources[0].operators_count }}"
-          - "  Dashboard        : http://{{ ansible_host }}:{{ grafana_port }}/d/ocp-cluster-overview"
-          - "================================================"
+          - "Plik datasource wygenerowany:"
+          - "  {{ output_dir }}/ocp-{{ cluster_name }}.yml"
+          - ""
+          - "Skopiuj go na hosta Grafany:"
+          - "  scp {{ output_dir }}/ocp-{{ cluster_name }}.yml \\"
+          - "      marek@<grafana-host>:/tmp/ocp-{{ cluster_name }}.yml"
+          - ""
+          - "Na hoscie Grafany:"
+          - "  sudo mv /tmp/ocp-{{ cluster_name }}.yml \\"
+          - "          /etc/grafana/provisioning/datasources/ocp-{{ cluster_name }}.yml"
+          - "  sudo chown grafana:grafana \\"
+          - "          /etc/grafana/provisioning/datasources/ocp-{{ cluster_name }}.yml"
+          - "  sudo systemctl reload grafana-server"
