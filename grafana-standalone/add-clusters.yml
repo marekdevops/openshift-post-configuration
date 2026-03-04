@@ -1,170 +1,171 @@
 ---
 # =============================================================================
-# OCP Monitoring — Dodawanie klastrow OCP do Grafany
+# OCP Monitoring — Dodaj aktualnie zalogowany klaster OCP do Grafany
 # =============================================================================
-# Dla kazdego klastra z vars/clusters.yml:
-#   1. Tworzy ServiceAccount + nie-wygasajacy token w OCP
-#   2. Pobiera Thanos Querier Route
-#   3. Testuje polaczenie
-#   4. Zapisuje datasource na hoscie Grafany
-#   5. Przeladowuje Grafane
+# Uzycie:
+#   1. Zaloguj sie do klastra:   oc login https://api.klaster.example.com ...
+#   2. Odpal playbook:           ansible-playbook add-clusters.yml \
+#                                  -i inventory/hosts.ini \
+#                                  -e cluster_name=prod \
+#                                  --ask-become-pass
 #
-# Schemat:
-#   [bastion]  — Play 1: laczy sie z OCP, zbiera tokeny i URL-e
-#   [grafana]  — Play 2: dostaje dane z bastionu i zapisuje datasource files
-#
-# Uzycie (z poziomu bastionu):
-#   ansible-playbook add-clusters.yml -i inventory/hosts.ini --ask-become-pass
-#
-# Dodanie jednego klastra:
-#   ansible-playbook add-clusters.yml -i inventory/hosts.ini \
-#       -e '{"ocp_clusters":[{"name":"prod","kubeconfig":"~/.kube/prod"}]}' \
-#       --ask-become-pass
+# cluster_name to nazwa ktora pojawi sie w dropdown Grafany ("OCP - prod")
 # =============================================================================
 
 # =============================================================================
-# PLAY 1 — bastion: Zbierz tokeny i URL-e dla wszystkich klastrow OCP
+# PLAY 1 — bastion: Pobierz dane z aktualnie zalogowanego klastra OCP
 # =============================================================================
-- name: "Play 1/2 — Pobieranie danych z klastrow OCP (bastion)"
+- name: "Play 1/2 — Pobieranie danych z klastra OCP"
   hosts: bastion
   gather_facts: false
-  vars_files:
-    - vars/clusters.yml
   vars:
     monitoring_namespace: openshift-monitoring
     validate_certs: false
 
   tasks:
 
-    - name: Inicjalizacja listy datasources
-      ansible.builtin.set_fact:
-        cluster_datasources: []
+    - name: Sprawdzenie zmiennej cluster_name
+      ansible.builtin.fail:
+        msg: |
+          Brak wymaganej zmiennej cluster_name.
+          Uzycie: ansible-playbook add-clusters.yml -i inventory/hosts.ini -e cluster_name=prod --ask-become-pass
+      when: cluster_name is not defined or cluster_name == ""
 
-    - name: "Konfiguracja klastra: {{ ocp_cluster.name }}"
-      block:
+    - name: Sprawdzenie aktywnego logowania OCP (oc whoami)
+      ansible.builtin.command:
+        cmd: oc whoami
+      register: oc_whoami
+      changed_when: false
+      failed_when: oc_whoami.rc != 0
 
-        - name: "[{{ ocp_cluster.name }}] Tworzenie ServiceAccount"
-          kubernetes.core.k8s:
-            kubeconfig: "{{ ocp_cluster.kubeconfig }}"
-            state: present
-            definition:
-              apiVersion: v1
-              kind: ServiceAccount
-              metadata:
-                name: grafana-monitoring-reader
-                namespace: "{{ monitoring_namespace }}"
-                labels:
-                  app: grafana-monitoring
-                  cluster: "{{ ocp_cluster.name }}"
-                  managed-by: ansible
+    - name: Sprawdzenie serwera klastra (oc whoami --show-server)
+      ansible.builtin.command:
+        cmd: oc whoami --show-server
+      register: oc_server
+      changed_when: false
 
-        - name: "[{{ ocp_cluster.name }}] Nadawanie ClusterRoleBinding"
-          kubernetes.core.k8s:
-            kubeconfig: "{{ ocp_cluster.kubeconfig }}"
-            state: present
-            definition:
-              apiVersion: rbac.authorization.k8s.io/v1
-              kind: ClusterRoleBinding
-              metadata:
-                name: "grafana-monitoring-view"
-                labels:
-                  app: grafana-monitoring
-                  managed-by: ansible
-              roleRef:
-                apiGroup: rbac.authorization.k8s.io
-                kind: ClusterRole
-                name: cluster-monitoring-view
-              subjects:
-                - kind: ServiceAccount
-                  name: grafana-monitoring-reader
-                  namespace: "{{ monitoring_namespace }}"
+    - name: "Potwierdzenie kontekstu"
+      ansible.builtin.debug:
+        msg:
+          - "Klaster  : {{ cluster_name }}"
+          - "API URL  : {{ oc_server.stdout }}"
+          - "Uzytkownik: {{ oc_whoami.stdout }}"
 
-        - name: "[{{ ocp_cluster.name }}] Tworzenie nie-wygasajacego tokenu"
-          kubernetes.core.k8s:
-            kubeconfig: "{{ ocp_cluster.kubeconfig }}"
-            state: present
-            definition:
-              apiVersion: v1
-              kind: Secret
-              metadata:
-                name: grafana-monitoring-reader-token
-                namespace: "{{ monitoring_namespace }}"
-                annotations:
-                  kubernetes.io/service-account.name: grafana-monitoring-reader
-                labels:
-                  app: grafana-monitoring
-                  managed-by: ansible
-              type: kubernetes.io/service-account-token
+    # -------------------------------------------------------------------------
+    # ServiceAccount + nie-wygasajacy token
+    # -------------------------------------------------------------------------
+    - name: Tworzenie ServiceAccount grafana-monitoring-reader
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: grafana-monitoring-reader
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: grafana-monitoring
+              cluster: "{{ cluster_name }}"
+              managed-by: ansible
 
-        - name: "[{{ ocp_cluster.name }}] Oczekiwanie na token (max 60s)"
-          kubernetes.core.k8s_info:
-            kubeconfig: "{{ ocp_cluster.kubeconfig }}"
-            api_version: v1
-            kind: Secret
+    - name: Nadawanie ClusterRoleBinding cluster-monitoring-view
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: grafana-monitoring-view
+            labels:
+              app: grafana-monitoring
+              managed-by: ansible
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-monitoring-view
+          subjects:
+            - kind: ServiceAccount
+              name: grafana-monitoring-reader
+              namespace: "{{ monitoring_namespace }}"
+
+    - name: Tworzenie nie-wygasajacego tokenu (SA Secret)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
             name: grafana-monitoring-reader-token
             namespace: "{{ monitoring_namespace }}"
-          register: token_secret
-          until:
-            - token_secret.resources | length > 0
-            - token_secret.resources[0].data is defined
-            - token_secret.resources[0].data.token is defined
-          retries: 12
-          delay: 5
+            annotations:
+              kubernetes.io/service-account.name: grafana-monitoring-reader
+            labels:
+              app: grafana-monitoring
+              managed-by: ansible
+          type: kubernetes.io/service-account-token
 
-        - name: "[{{ ocp_cluster.name }}] Pobieranie Route Thanos Querier"
-          kubernetes.core.k8s_info:
-            kubeconfig: "{{ ocp_cluster.kubeconfig }}"
-            api_version: route.openshift.io/v1
-            kind: Route
-            name: thanos-querier
-            namespace: "{{ monitoring_namespace }}"
-          register: thanos_route
+    - name: Oczekiwanie na wypelnienie tokenu (max 60s)
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: grafana-monitoring-reader-token
+        namespace: "{{ monitoring_namespace }}"
+      register: token_secret
+      until:
+        - token_secret.resources | length > 0
+        - token_secret.resources[0].data is defined
+        - token_secret.resources[0].data.token is defined
+      retries: 12
+      delay: 5
 
-        - name: "[{{ ocp_cluster.name }}] Test polaczenia z Thanos Querier"
-          ansible.builtin.uri:
-            url: "https://{{ thanos_route.resources[0].spec.host }}/api/v1/query"
-            method: POST
-            headers:
-              Authorization: "Bearer {{ token_secret.resources[0].data.token | b64decode }}"
-              Content-Type: "application/x-www-form-urlencoded"
-            body_format: form-urlencoded
-            body:
-              query: 'cluster_operator_conditions{condition="Available"}'
-            validate_certs: "{{ validate_certs }}"
-            status_code: 200
-            timeout: 30
-          register: test_result
+    # -------------------------------------------------------------------------
+    # Thanos Querier Route
+    # -------------------------------------------------------------------------
+    - name: Pobieranie Route thanos-querier
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: thanos-querier
+        namespace: "{{ monitoring_namespace }}"
+      register: thanos_route
 
-        - name: "[{{ ocp_cluster.name }}] Dodawanie do listy datasources"
-          ansible.builtin.set_fact:
-            cluster_datasources: >-
-              {{
-                cluster_datasources + [{
-                  'name': ocp_cluster.name,
-                  'thanos_url': 'https://' + thanos_route.resources[0].spec.host,
-                  'bearer_token': token_secret.resources[0].data.token | b64decode,
-                  'operators_count': test_result.json.data.result | length
-                }]
-              }}
+    # -------------------------------------------------------------------------
+    # Test polaczenia
+    # -------------------------------------------------------------------------
+    - name: "Test polaczenia z Thanos Querier"
+      ansible.builtin.uri:
+        url: "https://{{ thanos_route.resources[0].spec.host }}/api/v1/query"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ token_secret.resources[0].data.token | b64decode }}"
+          Content-Type: "application/x-www-form-urlencoded"
+        body_format: form-urlencoded
+        body:
+          query: 'cluster_operator_conditions{condition="Available"}'
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+        timeout: 30
+      register: test_result
 
-        - name: "[{{ ocp_cluster.name }}] OK — {{ test_result.json.data.result | length }} operatorow"
-          ansible.builtin.debug:
-            msg: "Klaster '{{ ocp_cluster.name }}' → {{ thanos_route.resources[0].spec.host }} — operatorow: {{ test_result.json.data.result | length }}"
+    - name: "Wynik testu — operatorow w klastrze: {{ test_result.json.data.result | length }}"
+      ansible.builtin.debug:
+        msg: "Thanos Querier odpowiada. Operatorow: {{ test_result.json.data.result | length }}"
 
-      rescue:
-        - name: "[{{ ocp_cluster.name }}] BLAD — klaster pominieto"
-          ansible.builtin.debug:
-            msg: "UWAGA: Klaster '{{ ocp_cluster.name }}' nie mogl zostac skonfigurowany — sprawdz kubeconfig i dostep do klastra"
-
-      loop: "{{ ocp_clusters }}"
-      loop_control:
-        loop_var: ocp_cluster
-        label: "{{ ocp_cluster.name }}"
+    # -------------------------------------------------------------------------
+    # Zapisz dane do przekazania do Play 2
+    # -------------------------------------------------------------------------
+    - name: Zapisanie danych datasource jako fact
+      ansible.builtin.set_fact:
+        cluster_datasources:
+          - name: "{{ cluster_name }}"
+            thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
+            bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
+            operators_count: "{{ test_result.json.data.result | length }}"
 
 # =============================================================================
-# PLAY 2 — grafana host: Zapisz datasource files i przeladuj Grafane
+# PLAY 2 — grafana host: Zapisz datasource i przeladuj Grafane
 # =============================================================================
-- name: "Play 2/2 — Provisioning datasources na hoscie Grafany"
+- name: "Play 2/2 — Provisioning datasource na hoscie Grafany"
   hosts: grafana
   become: true
   gather_facts: false
@@ -181,13 +182,13 @@
 
   tasks:
 
-    - name: "Sprawdzenie czy Grafana dziala"
+    - name: Sprawdzenie czy Grafana dziala
       ansible.builtin.systemd:
         name: grafana-server
       register: grafana_svc
       failed_when: grafana_svc.status.ActiveState != "active"
 
-    - name: "Tworzenie pliku datasource dla klastra {{ ds.name }}"
+    - name: "Zapis datasource: OCP - {{ ds.name }}"
       ansible.builtin.template:
         src: templates/datasource.yml.j2
         dest: "/etc/grafana/provisioning/datasources/ocp-{{ ds.name }}.yml"
@@ -200,23 +201,21 @@
         label: "{{ ds.name }}"
       notify: reload grafana
 
-    - name: "Wymuszenie przeladowania Grafany"
+    - name: Wymuszenie przeladowania Grafany
       ansible.builtin.meta: flush_handlers
 
-    - name: "Oczekiwanie az Grafana odpowie po reload (10s)"
+    - name: Oczekiwanie az Grafana odpowie po reload
       ansible.builtin.wait_for:
         host: localhost
         port: "{{ grafana_port }}"
         delay: 5
         timeout: 30
 
-    - name: "============ PODSUMOWANIE ============"
+    - name: "============ GOTOWE ============"
       ansible.builtin.debug:
         msg:
           - "================================================"
-          - "  Datasources dodane do Grafany:"
-          - "{% for ds in cluster_datasources %}  [OK] OCP - {{ ds.name }} ({{ ds.operators_count }} operatorow){% endfor %}"
-          - "------------------------------------------------"
-          - "  URL: http://{{ ansible_host }}:{{ grafana_port }}"
-          - "  Dashboard: http://{{ ansible_host }}:{{ grafana_port }}/d/ocp-cluster-overview"
+          - "  Dodano datasource: OCP - {{ cluster_datasources[0].name }}"
+          - "  Operatorow       : {{ cluster_datasources[0].operators_count }}"
+          - "  Dashboard        : http://{{ ansible_host }}:{{ grafana_port }}/d/ocp-cluster-overview"
           - "================================================"

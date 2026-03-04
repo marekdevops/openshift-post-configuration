@@ -8,16 +8,7 @@ grafana_admin_password: "OCP-Grafana-2025!"   # ZMIEN przed uruchomieniem
 grafana_domain: "{{ ansible_fqdn }}"          # lub np. grafana.firma.pl
 
 # =============================================================================
-# Lista klastrow OCP
-# Kazdy klaster = osobny datasource w Grafanie (widoczny w dropdown)
-# kubeconfig: sciezka do pliku kubeconfig NA MASZYNIE ANSIBLE (nie na hoście Grafany)
+# Klastry OCP dodajesz przez:
+#   oc login https://api.klaster.example.com ...
+#   ansible-playbook add-clusters.yml -i inventory/hosts.ini -e cluster_name=prod --ask-become-pass
 # =============================================================================
-ocp_clusters:
-  - name: prod
-    kubeconfig: "~/.kube/prod"
-
-  - name: dev
-    kubeconfig: "~/.kube/dev"
-
-  # - name: staging
-  #   kubeconfig: "~/.kube/staging"
