@@ -1,0 +1,346 @@
+---
+# =============================================================================
+# OCP Grafana Monitoring - Instalator
+# =============================================================================
+# Instaluje Grafana Operator przez OLM, tworzy instancje Grafany,
+# laczy z klastrem Prometheusem (Thanos Querier) i wgrywa dashboard.
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   Zalogowany uzytkownik z uprawnieniami cluster-admin
+#
+# Uzycie:
+#   ansible-playbook playbook.yml
+#   ansible-playbook playbook.yml -e grafana_admin_password=MojeHaslo123
+# =============================================================================
+
+- name: OCP - Deploy Grafana Monitoring Dashboard
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    grafana_namespace: grafana-monitoring
+    grafana_instance_name: ocp-grafana
+    grafana_admin_user: admin
+    grafana_admin_password: "OCP-Grafana-2025!"      # ZMIEN po pierwszym logowaniu
+    sa_name: grafana-monitoring-reader
+    secret_name: grafana-monitoring-reader-token
+    monitoring_namespace: openshift-monitoring
+    validate_certs: false
+    output_file: "{{ playbook_dir }}/grafana-ocp-credentials.env"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Namespace
+    # -------------------------------------------------------------------------
+    - name: "[1/9] Tworzenie namespace {{ grafana_namespace }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ grafana_namespace }}"
+            labels:
+              openshift.io/cluster-monitoring: "false"
+              managed-by: ansible
+
+    # -------------------------------------------------------------------------
+    # 2. OperatorGroup - ograniczony do namespace grafana-monitoring
+    # -------------------------------------------------------------------------
+    - name: "[2/9] Tworzenie OperatorGroup"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: grafana-operator-group
+            namespace: "{{ grafana_namespace }}"
+          spec:
+            targetNamespaces:
+              - "{{ grafana_namespace }}"
+
+    # -------------------------------------------------------------------------
+    # 3. Subscription - instalacja Grafana Operator v5 z OperatorHub
+    # -------------------------------------------------------------------------
+    - name: "[3/9] Instalacja Grafana Operator przez OLM (channel v5)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: grafana-operator
+            namespace: "{{ grafana_namespace }}"
+          spec:
+            channel: v5
+            installPlanApproval: Automatic
+            name: grafana-operator
+            source: community-operators
+            sourceNamespace: openshift-marketplace
+
+    # -------------------------------------------------------------------------
+    # 4. Czekaj az Grafana Operator CSV osiagnie status Succeeded
+    # -------------------------------------------------------------------------
+    - name: "[4/9] Oczekiwanie na gotowość Grafana Operator CSV (max 5 min)"
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ grafana_namespace }}"
+      register: csv_list
+      until:
+        - csv_list.resources | length > 0
+        - csv_list.resources
+          | selectattr('metadata.name', 'match', 'grafana-operator.*')
+          | list | length > 0
+        - (csv_list.resources
+          | selectattr('metadata.name', 'match', 'grafana-operator.*')
+          | list | first).status.phase == 'Succeeded'
+      retries: 30
+      delay: 10
+
+    # -------------------------------------------------------------------------
+    # 5. Instancja Grafana z Route (TLS edge)
+    # -------------------------------------------------------------------------
+    - name: "[5/9] Tworzenie instancji Grafana"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: grafana.integreatly.org/v1beta1
+          kind: Grafana
+          metadata:
+            name: "{{ grafana_instance_name }}"
+            namespace: "{{ grafana_namespace }}"
+            labels:
+              dashboards: "{{ grafana_instance_name }}"
+          spec:
+            config:
+              log:
+                mode: console
+                level: warn
+              auth:
+                disable_login_form: "false"
+              security:
+                admin_user: "{{ grafana_admin_user }}"
+                admin_password: "{{ grafana_admin_password }}"
+              server:
+                root_url: "%(protocol)s://%(domain)s/"
+                serve_from_sub_path: "false"
+              unified_alerting:
+                enabled: "false"
+              alerting:
+                enabled: "false"
+            route:
+              spec:
+                tls:
+                  termination: edge
+                  insecureEdgeTerminationPolicy: Redirect
+
+    - name: "[5/9] Oczekiwanie na pod Grafana (max 5 min)"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ grafana_namespace }}"
+        label_selectors:
+          - "app=grafana"
+      register: grafana_pods
+      until:
+        - grafana_pods.resources | length > 0
+        - grafana_pods.resources
+          | selectattr('status.phase', 'equalto', 'Running')
+          | list | length > 0
+      retries: 30
+      delay: 10
+
+    # -------------------------------------------------------------------------
+    # 6. ServiceAccount + nie-wygasajacy token dla Thanos Querier
+    # -------------------------------------------------------------------------
+    - name: "[6/9] Tworzenie ServiceAccount grafana-monitoring-reader"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ sa_name }}"
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: grafana-monitoring
+              managed-by: ansible
+
+    - name: "[6/9] Nadawanie ClusterRoleBinding cluster-monitoring-view"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: grafana-monitoring-view
+            labels:
+              app: grafana-monitoring
+              managed-by: ansible
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-monitoring-view
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ sa_name }}"
+              namespace: "{{ monitoring_namespace }}"
+
+    - name: "[6/9] Tworzenie nie-wygasajacego SA Token Secret"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ secret_name }}"
+            namespace: "{{ monitoring_namespace }}"
+            annotations:
+              kubernetes.io/service-account.name: "{{ sa_name }}"
+            labels:
+              app: grafana-monitoring
+              managed-by: ansible
+          type: kubernetes.io/service-account-token
+
+    - name: "Oczekiwanie na wypelnienie tokenu (max 60s)"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ secret_name }}"
+        namespace: "{{ monitoring_namespace }}"
+      register: token_secret
+      until:
+        - token_secret.resources | length > 0
+        - token_secret.resources[0].data is defined
+        - token_secret.resources[0].data.token is defined
+      retries: 12
+      delay: 5
+
+    - name: Dekodowanie tokenu
+      ansible.builtin.set_fact:
+        bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
+
+    # -------------------------------------------------------------------------
+    # 7. Pobierz Route Thanos Querier
+    # -------------------------------------------------------------------------
+    - name: "[7/9] Pobieranie Route Thanos Querier"
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: thanos-querier
+        namespace: "{{ monitoring_namespace }}"
+      register: thanos_route
+
+    - name: Ustawianie URL Thanos Querier
+      ansible.builtin.set_fact:
+        thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
+
+    # -------------------------------------------------------------------------
+    # 8. GrafanaDatasource - Thanos Querier jako domyslne zrodlo
+    # -------------------------------------------------------------------------
+    - name: "[8/9] Tworzenie GrafanaDatasource → Thanos Querier"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: grafana.integreatly.org/v1beta1
+          kind: GrafanaDatasource
+          metadata:
+            name: thanos-querier-ocp
+            namespace: "{{ grafana_namespace }}"
+          spec:
+            instanceSelector:
+              matchLabels:
+                dashboards: "{{ grafana_instance_name }}"
+            datasource:
+              name: "Thanos Querier OCP"
+              type: prometheus
+              access: proxy
+              url: "{{ thanos_url }}"
+              isDefault: true
+              editable: true
+              jsonData:
+                httpMethod: POST
+                httpHeaderName1: "Authorization"
+                timeInterval: "30s"
+                tlsSkipVerify: "{{ not validate_certs }}"
+              secureJsonData:
+                httpHeaderValue1: "Bearer {{ bearer_token }}"
+
+    # -------------------------------------------------------------------------
+    # 9. GrafanaDashboard - OCP Cluster Overview
+    # -------------------------------------------------------------------------
+    - name: "[9/9] Wgrywanie dashboardu OCP Cluster Overview"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: grafana.integreatly.org/v1beta1
+          kind: GrafanaDashboard
+          metadata:
+            name: ocp-cluster-overview
+            namespace: "{{ grafana_namespace }}"
+            labels:
+              app: grafana-monitoring
+          spec:
+            instanceSelector:
+              matchLabels:
+                dashboards: "{{ grafana_instance_name }}"
+            json: "{{ lookup('file', 'files/ocp-cluster-overview.json') }}"
+
+    # -------------------------------------------------------------------------
+    # Pobierz URL Grafana i zapisz credentials
+    # -------------------------------------------------------------------------
+    - name: Pobieranie Route Grafana
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        namespace: "{{ grafana_namespace }}"
+        label_selectors:
+          - "app=grafana"
+      register: grafana_route
+      until: grafana_route.resources | length > 0
+      retries: 10
+      delay: 5
+
+    - name: Ustawianie URL Grafana
+      ansible.builtin.set_fact:
+        grafana_url: "https://{{ grafana_route.resources[0].spec.host }}"
+
+    - name: Zapisywanie credentials do {{ output_file }}
+      ansible.builtin.copy:
+        content: |
+          # ============================================================
+          # Grafana OCP Monitoring Credentials
+          # Wygenerowano: {{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S"') }}
+          # ============================================================
+
+          GRAFANA_URL={{ grafana_url }}
+          GRAFANA_USER={{ grafana_admin_user }}
+          GRAFANA_PASSWORD={{ grafana_admin_password }}
+
+          THANOS_URL={{ thanos_url }}
+          BEARER_TOKEN={{ bearer_token }}
+
+          # Dashboard: {{ grafana_url }}/d/ocp-cluster-overview
+        dest: "{{ output_file }}"
+        mode: '0600'
+
+    - name: "============ PODSUMOWANIE ============"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "  GRAFANA ZAINSTALOWANA POMYSLNIE"
+          - "=============================================="
+          - "URL     : {{ grafana_url }}"
+          - "Login   : {{ grafana_admin_user }}"
+          - "Haslo   : {{ grafana_admin_password }}"
+          - "Dashboard: {{ grafana_url }}/d/ocp-cluster-overview"
+          - "----------------------------------------------"
+          - "Credentials: {{ output_file }}"
+          - "=============================================="
+          - "UWAGA: Zmien haslo po pierwszym logowaniu!"
+          - "=============================================="
