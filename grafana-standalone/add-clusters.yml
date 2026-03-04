@@ -9,21 +9,24 @@
 #   4. Zapisuje datasource na hoscie Grafany
 #   5. Przeladowuje Grafane
 #
-# Uzycie:
+# Schemat:
+#   [bastion]  — Play 1: laczy sie z OCP, zbiera tokeny i URL-e
+#   [grafana]  — Play 2: dostaje dane z bastionu i zapisuje datasource files
+#
+# Uzycie (z poziomu bastionu):
 #   ansible-playbook add-clusters.yml -i inventory/hosts.ini --ask-become-pass
 #
-# Dodanie jednego klastra (nadpisuje zmienna z vars/clusters.yml):
+# Dodanie jednego klastra:
 #   ansible-playbook add-clusters.yml -i inventory/hosts.ini \
 #       -e '{"ocp_clusters":[{"name":"prod","kubeconfig":"~/.kube/prod"}]}' \
 #       --ask-become-pass
 # =============================================================================
 
 # =============================================================================
-# PLAY 1 — localhost: Zbierz tokeny i URL-e dla wszystkich klastrow
+# PLAY 1 — bastion: Zbierz tokeny i URL-e dla wszystkich klastrow OCP
 # =============================================================================
-- name: "Play 1/2 — Pobieranie danych z klastrow OCP"
-  hosts: localhost
-  connection: local
+- name: "Play 1/2 — Pobieranie danych z klastrow OCP (bastion)"
+  hosts: bastion
   gather_facts: false
   vars_files:
     - vars/clusters.yml
@@ -168,7 +171,7 @@
   vars_files:
     - vars/clusters.yml
   vars:
-    cluster_datasources: "{{ hostvars['localhost']['cluster_datasources'] }}"
+    cluster_datasources: "{{ hostvars[groups['bastion'][0]]['cluster_datasources'] }}"
 
   handlers:
     - name: reload grafana
