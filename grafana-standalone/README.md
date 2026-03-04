@@ -1,33 +1,68 @@
 # OCP Grafana Standalone — Multi-Cluster Monitoring
 
-Grafana zainstalowana jako usługa systemd na dedykowanym hoście Linux.
-Każdy klaster OCP = osobny datasource. Wybierasz klaster z dropdown
-i widzisz ten sam dashboard dla wybranego środowiska.
+Grafana zainstalowana jako usługa systemd na dedykowanym hoście Linux (RHEL).
+Każdy klaster OCP = osobny datasource. Klastry dzielone na dwa typy —
+**INFRA** i **APP** — każdy typ ma osobny dashboard z własnym dropdownem.
 
 ---
 
 ## Architektura
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Linux Host (grafana-server)                        │
-│                                                     │
-│  grafana-server.service (systemd, port 3000)        │
-│  /etc/grafana/provisioning/datasources/             │
-│    ├── ocp-prod.yml  ──────────────────────────────┼──→  Thanos Querier (prod)
-│    ├── ocp-dev.yml   ──────────────────────────────┼──→  Thanos Querier (dev)
-│    └── ocp-staging.yml ───────────────────────────┼──→  Thanos Querier (staging)
-│  /var/lib/grafana/dashboards/                       │
-│    └── ocp-cluster-overview.json                   │
-└─────────────────────────────────────────────────────┘
-                          ▲
-                          │  ansible-playbook (SSH)
-                          │
-┌─────────────────────────────────────────────────────┐
-│  Maszyna Ansible (Twój laptop / bastion)            │
-│  vars/clusters.yml  ←─ edytujesz tutaj             │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Linux Host — grafana-server (RHEL, systemd, port 3000)     │
+│                                                             │
+│  /etc/grafana/provisioning/datasources/                     │
+│    ├── ocp-prod.yml   "OCP-INFRA - prod" ─────────────────┼──→ Thanos (prod)
+│    ├── ocp-dr.yml     "OCP-INFRA - dr"   ─────────────────┼──→ Thanos (dr)
+│    ├── ocp-dev.yml    "OCP-APP  - dev"   ─────────────────┼──→ Thanos (dev)
+│    └── ocp-test.yml   "OCP-APP  - test"  ─────────────────┼──→ Thanos (test)
+│                                                             │
+│  /var/lib/grafana/dashboards/                               │
+│    ├── ocp-cluster-overview.json  ← dropdown: OCP-INFRA -* │
+│    └── ocp-app-overview.json      ← dropdown: OCP-APP  -*  │
+└─────────────────────────────────────────────────────────────┘
+                        ▲
+                        │ scp (brak SSH z bastionu do grafany)
+                        │
+┌─────────────────────────────────────────────────────────────┐
+│  Bastion                                                    │
+│  - oc login → aktywny kontekst OCP                         │
+│  - ansible-playbook add-clusters.yml                        │
+│  - generuje: ./generated/ocp-<name>.yml                    │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Dwa dashboardy — separacja INFRA vs APP
+
+| Dashboard | Plik | Dla kogo | Regex dropdown |
+|---|---|---|---|
+| OCP Infra Clusters Overview | `ocp-cluster-overview.json` | klastry infrastrukturalne | `OCP-INFRA - .*` |
+| OCP App Clusters Overview | `ocp-app-overview.json` | klastry aplikacyjne | `OCP-APP - .*` |
+
+Klaster trafia do właściwego dashboardu przez prefiks nazwy datasource.
+Podajesz go przy dodawaniu klastra przez `-e cluster_type=INFRA` lub `-e cluster_type=APP`.
+
+---
+
+## Zawartość dashboardów
+
+Oba dashboardy zawierają identyczne sekcje:
+
+| Row | Panele |
+|---|---|
+| **Cluster Health** | Wersja OCP, węzły, pody Running, pody z problemem, operatory Degraded/Progressing |
+| **Utilizacja** | CPU per node (%), Memory per node (%) — timeseries |
+| **Cluster Operators** | Tabela wszystkich operatorów: Available / Degraded / Progressing |
+| **etcd Health** | Leader, Members, WAL fsync P99, DB Size |
+| **API Server** | Request rate, Error rate 5xx, Latency P99 |
+| **MachineConfigPool** | Tabela poolów: Total / Updated / Degraded / Unavailable |
+| **Firing Alerts** | Tabela aktywnych alertów z kolorowaniem severity |
+| **Pod Restarts** | Top 15 podów z restartami w ostatniej godzinie |
+| **PersistentVolumes** | Wykres % zajętości PV + tabela z wolnym miejscem |
+| **Certyfikaty** | Dni do wygaśnięcia certów kubelet per node |
 
 ---
 
@@ -36,16 +71,18 @@ i widzisz ten sam dashboard dla wybranego środowiska.
 ```
 grafana-standalone/
 ├── inventory/
-│   └── hosts.ini                  ← IP/hostname serwera Grafany
+│   └── hosts.ini                   ← IP/hostname serwera Grafany + bastion
 ├── vars/
-│   └── clusters.yml               ← Lista klastrow + haslo Grafany
+│   └── clusters.yml                ← Konfiguracja Grafany (port, haslo)
 ├── templates/
-│   ├── datasource.yml.j2          ← Template datasource per klaster
-│   └── dashboard-provider.yml.j2 ← Konfiguracja providera dashboardow
+│   ├── datasource.yml.j2           ← Template datasource per klaster
+│   └── dashboard-provider.yml.j2  ← Konfiguracja providera dashboardow
 ├── files/
-│   └── ocp-cluster-overview.json ← Dashboard JSON (multi-cluster)
-├── install-grafana.yml            ← Krok 1: instalacja Grafany
-├── add-clusters.yml               ← Krok 2: dodawanie klastrow OCP
+│   ├── ocp-cluster-overview.json  ← Dashboard INFRA (OCP-INFRA - .*)
+│   └── ocp-app-overview.json      ← Dashboard APP  (OCP-APP  - .*)
+├── generated/                      ← Wygenerowane datasource YAML (gitignore)
+├── install-grafana.yml             ← Instalacja Grafany na hoscie Linux
+├── add-clusters.yml                ← Dodawanie klastra OCP (z bastionu)
 └── README.md
 ```
 
@@ -54,50 +91,48 @@ grafana-standalone/
 ## Wymagania
 
 ### Host Grafany
-- RHEL 8/9, CentOS Stream, Fedora
-- Dostep SSH (ansible user z sudo)
-- Dostep do internetu lub repo wewnetrznego (Grafana RPM)
-- Port 3000 TCP wolny (lub inny w `grafana_port`)
-- Sieciowy dostep do Thanos Querier Route kazdego klastra OCP
+- RHEL 8/9 z aktywna subskrypcja i repo AppStream (pakiet `grafana`)
+- Uzytkownik z `sudo`
+- Port 3000 TCP otwarty
 
-### Maszyna Ansible
+### Bastion (skad uruchamiasz `add-clusters.yml`)
+- `oc` CLI zainstalowane i zalogowane do klastra
+- Python + kubernetes client:
 ```bash
 pip install kubernetes
 ansible-galaxy collection install kubernetes.core ansible.posix
 ```
 
-### Pliki kubeconfig
-Kazdy klaster musi miec dostepny plik kubeconfig na maszynie Ansible:
-```
-~/.kube/prod     ← klaster produkcyjny
-~/.kube/dev      ← klaster deweloperski
-```
+### Sieć
+- Bastion → OCP API (port 6443) ✓
+- Bastion → Thanos Querier Route (HTTPS) ✓ — do testu polaczenia
+- Bastion → Host Grafany — **nie jest wymagane** (plik generowany lokalnie, kopiujesz rcznie)
+- Host Grafany → Thanos Querier Route (HTTPS) ✓ — do odpytywania metryk
 
 ---
 
-## Instalacja krok po kroku
+## Instalacja — krok po kroku
 
-### Krok 0 — Przygotuj konfigurację
+### Krok 0 — Konfiguracja
 
-**1. Edytuj `inventory/hosts.ini`** — podaj IP/hostname serwera Grafany:
+**`inventory/hosts.ini`** — podaj IP hosta Grafany:
 ```ini
 [grafana]
 grafana-server ansible_host=192.168.1.100 ansible_user=marek
+
+[bastion]
+bastion ansible_connection=local ansible_python_interpreter=/usr/bin/python3
 ```
 
-**2. Edytuj `vars/clusters.yml`** — podaj klastry i haslo:
+**`vars/clusters.yml`** — zmień hasło admina:
 ```yaml
 grafana_admin_password: "TwojeHasloTutaj!"
-
-ocp_clusters:
-  - name: prod
-    kubeconfig: "~/.kube/prod"
-  - name: dev
-    kubeconfig: "~/.kube/dev"
+grafana_port: 3000
 ```
 
-### Krok 1 — Zainstaluj Grafanę
+### Krok 1 — Instalacja Grafany
 
+Uruchom z maszyny z SSH do hosta Grafany:
 ```bash
 ansible-playbook install-grafana.yml \
   -i inventory/hosts.ini \
@@ -105,123 +140,183 @@ ansible-playbook install-grafana.yml \
 ```
 
 Co robi:
-- Dodaje repo Grafana RPM
-- Instaluje pakiet `grafana`
-- Konfiguruje `grafana.ini` (port, haslo, logi)
+- Weryfikuje dostępność pakietu `grafana` w RHEL AppStream
+- Instaluje pakiet `grafana` (bez dostępu do internetu)
+- Konfiguruje `grafana.ini` (port, hasło, logi, brak alertingu)
 - Tworzy katalogi provisioning
-- Wgrywa dashboard JSON
+- Kopiuje **oba dashboardy** JSON
 - Otwiera port w firewalld
 - Uruchamia `grafana-server.service`
 
-Po zakonczeniu Grafana dostepna pod: `http://<host>:3000`
+### Krok 2 — Dodawanie klastrów OCP
 
-### Krok 2 — Dodaj klastry OCP
+Uruchamiasz **z bastionu** dla każdego klastra osobno:
 
 ```bash
+# Klaster infrastrukturalny
+oc login https://api.prod.example.com -u admin -p haslo
 ansible-playbook add-clusters.yml \
   -i inventory/hosts.ini \
-  --ask-become-pass
+  -e cluster_name=prod \
+  -e cluster_type=INFRA
+
+# Klaster aplikacyjny
+oc login https://api.dev.example.com -u admin -p haslo
+ansible-playbook add-clusters.yml \
+  -i inventory/hosts.ini \
+  -e cluster_name=dev \
+  -e cluster_type=APP
 ```
 
-Co robi dla każdego klastra z `vars/clusters.yml`:
-- Tworzy `ServiceAccount` + nie-wygasający token w `openshift-monitoring`
-- Pobiera Route `thanos-querier`
-- Testuje połączenie (HTTP 200)
-- Zapisuje plik datasource w `/etc/grafana/provisioning/datasources/`
-- Przeładowuje Grafanę
+Playbook:
+1. Sprawdza `oc whoami` — czy jesteś zalogowany i do jakiego klastra
+2. Tworzy `ServiceAccount grafana-monitoring-reader` w `openshift-monitoring`
+3. Nadaje `ClusterRoleBinding cluster-monitoring-view` (read-only)
+4. Tworzy nie-wygasający token (`kubernetes.io/service-account-token`)
+5. Pobiera Route `thanos-querier`
+6. Testuje połączenie (HTTP 200)
+7. Generuje plik `./generated/ocp-<name>.yml`
+8. Wypisuje instrukcję co zrobić dalej
 
-### Krok 3 — Otwórz dashboard
+### Krok 3 — Skopiuj datasource na hosta Grafany
+
+Playbook nie ma SSH do hosta Grafany — kopiujesz ręcznie:
+
+```bash
+# Z maszyny z dostępem SSH do grafany
+scp generated/ocp-prod.yml marek@grafana:/tmp/
+
+# Na hoscie Grafany
+sudo mv /tmp/ocp-prod.yml /etc/grafana/provisioning/datasources/
+sudo chown grafana:grafana /etc/grafana/provisioning/datasources/ocp-prod.yml
+sudo systemctl reload grafana-server
+```
+
+### Krok 4 — Otwórz dashboardy
 
 ```
-http://<host-grafany>:3000/d/ocp-cluster-overview
+http://<grafana-host>:3000/d/ocp-cluster-overview   ← klastry INFRA
+http://<grafana-host>:3000/d/ocp-app-overview        ← klastry APP
 ```
 
-1. Zaloguj jako `admin` / hasło z `clusters.yml`
-2. W górnym dropdownie **"Klaster OCP"** wybierz środowisko
-3. Dashboard automatycznie przełącza dane
+Zaloguj jako `admin` / hasło z `vars/clusters.yml`.
+Wybierz klaster z dropdown — dashboard przełącza dane.
 
 ---
 
-## Dodawanie kolejnego klastra
+## Aktualizacja dashboardów
 
-1. Dodaj wpis w `vars/clusters.yml`:
-```yaml
-ocp_clusters:
-  - name: staging
-    kubeconfig: "~/.kube/staging"
-```
+Gdy zmienisz pliki JSON (nowe panele, poprawki):
 
-2. Uruchom tylko `add-clusters.yml` (instalacja Grafany nie jest potrzebna):
+**Opcja A — ponownie install-grafana.yml (zalecane)**
 ```bash
-ansible-playbook add-clusters.yml -i inventory/hosts.ini --ask-become-pass
+ansible-playbook install-grafana.yml -i inventory/hosts.ini --ask-become-pass
+```
+Ansible wykryje zmienione pliki JSON, skopiuje je i zrestartuje Grafanę. Reszta tasków bez zmian.
+
+**Opcja B — ręcznie**
+```bash
+scp files/ocp-cluster-overview.json marek@grafana:/tmp/
+scp files/ocp-app-overview.json     marek@grafana:/tmp/
+
+# Na hoscie Grafany
+sudo cp /tmp/ocp-*.json /var/lib/grafana/dashboards/
+sudo chown grafana:grafana /var/lib/grafana/dashboards/ocp-*.json
+sudo systemctl reload grafana-server
 ```
 
-Nowy datasource `OCP - staging` pojawi się automatycznie w dropdown.
+---
+
+## Migracja istniejących klastrów (stara nazwa datasource)
+
+Klastry dodane przed wprowadzeniem podziału INFRA/APP mają nazwę `OCP - <name>`
+i nie pasują do żadnego dashboardu. Żeby je przenieść:
+
+```bash
+# 1. Zaloguj się do klastra
+oc login https://api.prod.example.com ...
+
+# 2. Ponownie odpal add-clusters.yml z cluster_type
+ansible-playbook add-clusters.yml -i inventory/hosts.ini \
+  -e cluster_name=prod -e cluster_type=INFRA
+
+# 3. Na hoscie Grafany — usuń stary datasource, wgraj nowy
+sudo rm /etc/grafana/provisioning/datasources/ocp-prod.yml
+scp generated/ocp-prod.yml marek@grafana:/tmp/
+sudo mv /tmp/ocp-prod.yml /etc/grafana/provisioning/datasources/
+sudo chown grafana:grafana /etc/grafana/provisioning/datasources/ocp-prod.yml
+sudo systemctl reload grafana-server
+```
+
+Grafana po reload usunie `OCP - prod` i doda `OCP-INFRA - prod`.
 
 ---
 
 ## Troubleshooting
 
 ### Grafana nie startuje
-
 ```bash
-# Na hoscie Grafany
 sudo systemctl status grafana-server
 sudo journalctl -u grafana-server -n 50
 ```
 
-### Datasource nie widzi metryk (No data)
-
+### Pakiet grafana niedostępny w repo
 ```bash
-# Na maszynie Ansible — sprawdz token i URL
-TOKEN=$(oc get secret grafana-monitoring-reader-token \
-  -n openshift-monitoring \
-  -o jsonpath='{.data.token}' --kubeconfig=~/.kube/prod | base64 -d)
-
-THANOS=$(oc get route thanos-querier \
-  -n openshift-monitoring \
-  -o jsonpath='{.spec.host}' --kubeconfig=~/.kube/prod)
-
-curl -sk -H "Authorization: Bearer $TOKEN" \
-  "https://$THANOS/api/v1/query?query=cluster_operator_conditions" | jq .status
+subscription-manager repos --list-enabled | grep -i appstream
+dnf repolist | grep appstream
+dnf info grafana
 ```
 
-### Dropdown "Klaster OCP" jest pusty
-
-Sprawdz czy datasource'y zostaly zapisane i maja prefix `OCP - `:
+### Dropdown jest pusty (brak klastrów)
 ```bash
+# Sprawdz pliki datasource i ich nazwy
 ls /etc/grafana/provisioning/datasources/
-sudo cat /etc/grafana/provisioning/datasources/ocp-prod.yml
+sudo cat /etc/grafana/provisioning/datasources/ocp-prod.yml | grep "name:"
+# Nazwa musi pasowac do regex dashboardu:
+#   OCP Infra: "OCP-INFRA - prod"
+#   OCP App:   "OCP-APP - dev"
 sudo systemctl reload grafana-server
 ```
 
-### Grafana nie ma dostępu do klastra (sieć)
-
-Serwer Grafany musi miec dostep do Route thanos-querier.
-Sprawdz z hosta Grafany:
+### No data w panelach
 ```bash
+# Test z bastionu — sprawdz token i URL
+TOKEN=$(oc get secret grafana-monitoring-reader-token \
+  -n openshift-monitoring -o jsonpath='{.data.token}' | base64 -d)
+THANOS=$(oc get route thanos-querier \
+  -n openshift-monitoring -o jsonpath='{.spec.host}')
+
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://$THANOS/api/v1/query?query=cluster_operator_conditions" | jq .status
+# Oczekiwane: "success"
+```
+
+### Grafana nie dociera do Thanos (sieć)
+```bash
+# Na hoscie Grafany — sprawdz czy widzi Route
 curl -sk https://<thanos-route>/api/v1/query?query=up
-# Powinno zwrocic 401 (Unauthorized) — to znaczy ze siec dziala
+# Powinno zwrocic 401 — siec dziala, brak tokenu to normalne
 ```
 
 ---
 
-## Sprzątanie jednego klastra
+## Usuwanie klastra
 
 ```bash
-# Usun datasource z Grafany
-sudo rm /etc/grafana/provisioning/datasources/ocp-dev.yml
+# Na hoscie Grafany
+sudo rm /etc/grafana/provisioning/datasources/ocp-prod.yml
 sudo systemctl reload grafana-server
 
-# Usun SA i token z OCP
-oc delete clusterrolebinding grafana-monitoring-view --kubeconfig=~/.kube/dev
-oc delete secret grafana-monitoring-reader-token -n openshift-monitoring --kubeconfig=~/.kube/dev
-oc delete serviceaccount grafana-monitoring-reader -n openshift-monitoring --kubeconfig=~/.kube/dev
+# W OCP
+oc delete clusterrolebinding grafana-monitoring-view
+oc delete secret grafana-monitoring-reader-token -n openshift-monitoring
+oc delete serviceaccount grafana-monitoring-reader -n openshift-monitoring
 ```
+
+---
 
 ## Backup Grafany
 
-Dane Grafany (dashboardy edytowane w UI, uzytkownicy, alerty):
 ```bash
 sudo tar czf grafana-backup-$(date +%Y%m%d).tar.gz \
   /var/lib/grafana \
