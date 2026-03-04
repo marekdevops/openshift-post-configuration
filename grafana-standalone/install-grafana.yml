@@ -1,7 +1,10 @@
 ---
 # =============================================================================
-# OCP Monitoring — Instalacja Grafany na hoscie Linux (RHEL/CentOS/Fedora)
+# OCP Monitoring — Instalacja Grafany na hoscie RHEL
 # =============================================================================
+# Grafana instalowana z repozytoriow RHEL (AppStream) — bez dostepu do internetu.
+# Wymagane aktywne subskrypcje RHEL z wlaczonym AppStream.
+#
 # Uzycie:
 #   ansible-playbook install-grafana.yml -i inventory/hosts.ini \
 #                    --ask-become-pass
@@ -11,7 +14,7 @@
 #                    -e grafana_admin_password=MojeHaslo123 --ask-become-pass
 # =============================================================================
 
-- name: Instalacja Grafana na hoscie Linux
+- name: Instalacja Grafana na hoscie RHEL
   hosts: grafana
   become: true
   vars_files:
@@ -31,22 +34,23 @@
   tasks:
 
     # -------------------------------------------------------------------------
-    # 1. Repozytorium Grafana
+    # 1. Weryfikacja repozytoriow RHEL
     # -------------------------------------------------------------------------
-    - name: "[1/7] Dodawanie repozytorium Grafana RPM"
-      ansible.builtin.yum_repository:
-        name: grafana
-        description: Grafana OSS
-        baseurl: https://rpm.grafana.com
-        gpgcheck: true
-        gpgkey: https://rpm.grafana.com/gpg.key
-        sslverify: true
-        enabled: true
+    - name: "[1/7] Sprawdzenie dostepnosci pakietu grafana w repozytoriach RHEL"
+      ansible.builtin.command:
+        cmd: dnf info grafana
+      register: dnf_info
+      changed_when: false
+      failed_when: dnf_info.rc != 0
+
+    - name: "[1/7] Wersja grafana dostepna w repo"
+      ansible.builtin.debug:
+        msg: "{{ dnf_info.stdout | regex_search('Version\\s*:\\s*(\\S+)', '\\1') | first | default('nieznana') }}"
 
     # -------------------------------------------------------------------------
-    # 2. Instalacja pakietu
+    # 2. Instalacja pakietu z AppStream
     # -------------------------------------------------------------------------
-    - name: "[2/7] Instalacja pakietu grafana"
+    - name: "[2/7] Instalacja pakietu grafana z RHEL AppStream"
       ansible.builtin.dnf:
         name: grafana
         state: present
