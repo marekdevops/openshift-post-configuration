@@ -1,0 +1,204 @@
+---
+# =============================================================================
+# OCP Monitoring — Instalacja Grafany na hoscie Linux (RHEL/CentOS/Fedora)
+# =============================================================================
+# Uzycie:
+#   ansible-playbook install-grafana.yml -i inventory/hosts.ini \
+#                    --ask-become-pass
+#
+# Opcjonalnie z haslem:
+#   ansible-playbook install-grafana.yml -i inventory/hosts.ini \
+#                    -e grafana_admin_password=MojeHaslo123 --ask-become-pass
+# =============================================================================
+
+- name: Instalacja Grafana na hoscie Linux
+  hosts: grafana
+  become: true
+  vars_files:
+    - vars/clusters.yml
+
+  handlers:
+    - name: restart grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
+
+    - name: reload firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: reloaded
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Repozytorium Grafana
+    # -------------------------------------------------------------------------
+    - name: "[1/7] Dodawanie repozytorium Grafana RPM"
+      ansible.builtin.yum_repository:
+        name: grafana
+        description: Grafana OSS
+        baseurl: https://rpm.grafana.com
+        gpgcheck: true
+        gpgkey: https://rpm.grafana.com/gpg.key
+        sslverify: true
+        enabled: true
+
+    # -------------------------------------------------------------------------
+    # 2. Instalacja pakietu
+    # -------------------------------------------------------------------------
+    - name: "[2/7] Instalacja pakietu grafana"
+      ansible.builtin.dnf:
+        name: grafana
+        state: present
+
+    # -------------------------------------------------------------------------
+    # 3. Konfiguracja grafana.ini (tylko kluczowe sekcje)
+    # -------------------------------------------------------------------------
+    - name: "[3/7] Konfiguracja grafana.ini — port"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: server
+        option: http_port
+        value: "{{ grafana_port }}"
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    - name: "[3/7] Konfiguracja grafana.ini — domain"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: server
+        option: domain
+        value: "{{ grafana_domain }}"
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    - name: "[3/7] Konfiguracja grafana.ini — admin user"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: security
+        option: admin_user
+        value: "{{ grafana_admin_user }}"
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    - name: "[3/7] Konfiguracja grafana.ini — admin password"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: security
+        option: admin_password
+        value: "{{ grafana_admin_password }}"
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    - name: "[3/7] Konfiguracja grafana.ini — logi (tylko warn)"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: log
+        option: level
+        value: warn
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    - name: "[3/7] Konfiguracja grafana.ini — wylaczenie alertingu (nie potrzebny)"
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: unified_alerting
+        option: enabled
+        value: "false"
+        mode: '0640'
+        owner: root
+        group: grafana
+      notify: restart grafana
+
+    # -------------------------------------------------------------------------
+    # 4. Katalogi provisioning i dashboards
+    # -------------------------------------------------------------------------
+    - name: "[4/7] Tworzenie katalogow provisioning"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: grafana
+        group: grafana
+        mode: '0750'
+      loop:
+        - /etc/grafana/provisioning/datasources
+        - /etc/grafana/provisioning/dashboards
+        - /var/lib/grafana/dashboards
+
+    - name: "[4/7] Wgrywanie konfiguracji dashboard providera"
+      ansible.builtin.template:
+        src: templates/dashboard-provider.yml.j2
+        dest: /etc/grafana/provisioning/dashboards/ocp-provider.yml
+        owner: grafana
+        group: grafana
+        mode: '0640'
+      notify: restart grafana
+
+    # -------------------------------------------------------------------------
+    # 5. Dashboard JSON
+    # -------------------------------------------------------------------------
+    - name: "[5/7] Kopiowanie dashboardu OCP Cluster Overview"
+      ansible.builtin.copy:
+        src: files/ocp-cluster-overview.json
+        dest: /var/lib/grafana/dashboards/ocp-cluster-overview.json
+        owner: grafana
+        group: grafana
+        mode: '0640'
+      notify: restart grafana
+
+    # -------------------------------------------------------------------------
+    # 6. Firewall — port Grafany
+    # -------------------------------------------------------------------------
+    - name: "[6/7] Sprawdzenie czy firewalld dziala"
+      ansible.builtin.systemd:
+        name: firewalld
+      register: firewalld_status
+      ignore_errors: true
+
+    - name: "[6/7] Otwarcie portu {{ grafana_port }}/tcp w firewalld"
+      ansible.posix.firewalld:
+        port: "{{ grafana_port }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+      when: firewalld_status.status.ActiveState == "active"
+      notify: reload firewalld
+
+    # -------------------------------------------------------------------------
+    # 7. Uruchomienie uslugi
+    # -------------------------------------------------------------------------
+    - name: "[7/7] Wlaczenie i start grafana-server"
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: "Oczekiwanie az Grafana odpowie na porcie {{ grafana_port }}"
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ grafana_port }}"
+        delay: 3
+        timeout: 60
+
+    - name: "============ GRAFANA ZAINSTALOWANA ============"
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "  Grafana dziala na hoscie: {{ inventory_hostname }}"
+          - "  URL    : http://{{ ansible_host }}:{{ grafana_port }}"
+          - "  Login  : {{ grafana_admin_user }}"
+          - "  Haslo  : {{ grafana_admin_password }}"
+          - "================================================"
+          - "Nastepny krok: uruchom add-clusters.yml"
+          - "================================================"

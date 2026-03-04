@@ -1,0 +1,19 @@
+# Grafana provisioning datasource — OCP {{ ds.name }}
+# Wygenerowano przez Ansible — nie edytuj recznie
+apiVersion: 1
+
+datasources:
+  - name: "OCP - {{ ds.name }}"
+    type: prometheus
+    uid: "ocp-{{ ds.name | lower | regex_replace('[^a-z0-9]', '-') }}"
+    access: proxy
+    url: "{{ ds.thanos_url }}"
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMethod: POST
+      httpHeaderName1: "Authorization"
+      timeInterval: "30s"
+      tlsSkipVerify: true
+    secureJsonData:
+      httpHeaderValue1: "Bearer {{ ds.bearer_token }}"
