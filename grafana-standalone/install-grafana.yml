@@ -151,13 +151,18 @@
     # -------------------------------------------------------------------------
     # 5. Dashboard JSON
     # -------------------------------------------------------------------------
-    - name: "[5/7] Kopiowanie dashboardu OCP Cluster Overview"
+    - name: "[5/7] Kopiowanie dashboardow OCP"
       ansible.builtin.copy:
-        src: files/ocp-cluster-overview.json
-        dest: /var/lib/grafana/dashboards/ocp-cluster-overview.json
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
         owner: grafana
         group: grafana
         mode: '0640'
+      loop:
+        - src: files/ocp-cluster-overview.json
+          dest: /var/lib/grafana/dashboards/ocp-cluster-overview.json
+        - src: files/ocp-app-overview.json
+          dest: /var/lib/grafana/dashboards/ocp-app-overview.json
       notify: restart grafana
 
     # -------------------------------------------------------------------------

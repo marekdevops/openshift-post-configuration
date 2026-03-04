@@ -1,8 +1,8 @@
 {
-  "title": "OCP Infra Clusters Overview",
-  "uid": "ocp-cluster-overview",
-  "description": "OpenShift — klastry infrastrukturalne. Operatory, wezly, etcd, API Server, MCP, alerty, pody, storage, certyfikaty.",
-  "tags": ["openshift", "infra", "cluster"],
+  "title": "OCP App Clusters Overview",
+  "uid": "ocp-app-overview",
+  "description": "OpenShift — klastry aplikacyjne. Operatory, wezly, alerty, pody, storage.",
+  "tags": ["openshift", "app", "cluster"],
   "timezone": "browser",
   "schemaVersion": 38,
   "version": 2,
@@ -18,15 +18,15 @@
         "current": {},
         "hide": 0,
         "includeAll": false,
-        "label": "Klaster INFRA",
+        "label": "Klaster APP",
         "multi": false,
         "name": "datasource",
         "options": [],
         "query": "prometheus",
-        "regex": "OCP-INFRA - .*",
+        "regex": "OCP-APP - .*",
         "refresh": 1,
         "type": "datasource",
-        "description": "Wybierz klaster infrastrukturalny"
+        "description": "Wybierz klaster aplikacyjny"
       }
     ]
   },

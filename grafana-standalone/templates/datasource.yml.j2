@@ -1,11 +1,11 @@
-# Grafana provisioning datasource — OCP {{ ds.name }}
+# Grafana provisioning datasource — OCP {{ ds.cluster_type }} - {{ ds.name }}
 # Wygenerowano przez Ansible — nie edytuj recznie
 apiVersion: 1
 
 datasources:
-  - name: "OCP - {{ ds.name }}"
+  - name: "OCP-{{ ds.cluster_type }} - {{ ds.name }}"
     type: prometheus
-    uid: "ocp-{{ ds.name | lower | regex_replace('[^a-z0-9]', '-') }}"
+    uid: "ocp-{{ ds.cluster_type | lower }}-{{ ds.name | lower | regex_replace('[^a-z0-9]', '-') }}"
     access: proxy
     url: "{{ ds.thanos_url }}"
     isDefault: false

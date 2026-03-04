@@ -6,7 +6,11 @@
 #   1. Zaloguj sie do klastra:   oc login https://api.klaster.example.com ...
 #   2. Odpal playbook:           ansible-playbook add-clusters.yml \
 #                                  -i inventory/hosts.ini \
-#                                  -e cluster_name=prod
+#                                  -e cluster_name=prod \
+#                                  -e cluster_type=INFRA   # lub APP
+#
+# cluster_type=INFRA  → datasource "OCP-INFRA - prod"  → dashboard "OCP Infra Clusters"
+# cluster_type=APP    → datasource "OCP-APP  - dev"    → dashboard "OCP App Clusters"
 #
 # Playbook wygeneruje plik datasource na bastionie w katalogu ./generated/
 # Nastepnie skopiuj go recznie na hosta Grafany (instrukcja na koncu).
@@ -22,12 +26,16 @@
 
   tasks:
 
-    - name: Sprawdzenie zmiennej cluster_name
+    - name: Sprawdzenie wymaganych zmiennych
       ansible.builtin.fail:
         msg: |
-          Brak wymaganej zmiennej cluster_name.
-          Uzycie: ansible-playbook add-clusters.yml -i inventory/hosts.ini -e cluster_name=prod
-      when: cluster_name is not defined or cluster_name == ""
+          Brak wymaganej zmiennej: {{ item.var }}
+          Uzycie: ansible-playbook add-clusters.yml -i inventory/hosts.ini \
+                    -e cluster_name=prod -e cluster_type=INFRA
+      when: item.val is not defined or item.val == ""
+      loop:
+        - { var: "cluster_name", val: "{{ cluster_name | default('') }}" }
+        - { var: "cluster_type (INFRA lub APP)", val: "{{ cluster_type | default('') }}" }
 
     - name: Sprawdzenie aktywnego logowania OCP (oc whoami)
       ansible.builtin.command:
@@ -166,6 +174,7 @@
       vars:
         ds:
           name: "{{ cluster_name }}"
+          cluster_type: "{{ cluster_type }}"
           thanos_url: "https://{{ thanos_route.resources[0].spec.host }}"
           bearer_token: "{{ token_secret.resources[0].data.token | b64decode }}"
 
