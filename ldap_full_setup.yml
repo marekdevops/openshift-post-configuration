@@ -173,7 +173,7 @@
           type: LDAP
           ldap:
             attributes:
-              id: ["dn"]
+              id: ["{{ ldap_username_attribute }}"]
               email: ["mail"]
               name: ["cn"]
               preferredUsername: ["{{ ldap_username_attribute }}"]
