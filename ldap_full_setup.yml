@@ -319,7 +319,7 @@
               - "{{ ldap_group_membership_attribute }}"
       tags: [sync]
 
-    - name: "ConfigMap — {{ ldap_configmap_name }} (LDAPSyncConfig)"
+    - name: "ConfigMap — {{ ldap_configmap_name }} (LDAPSyncConfig + whitelist grup)"
       kubernetes.core.k8s:
         state: present
         definition:
@@ -332,6 +332,7 @@
               app.kubernetes.io/managed-by: ansible
           data:
             ldap-group-sync.yaml: "{{ _ldap_sync_config | to_nice_yaml(indent=2) }}"
+            ldap-group-whitelist.txt: "{{ ldap_sync_groups.keys() | join('\n') }}\n"
       tags: [sync]
 
     # =========================================================================
@@ -369,6 +370,7 @@
                           - |
                             oc adm groups sync \
                               --sync-config=/config/ldap-group-sync.yaml \
+                              --whitelist=/config/ldap-group-whitelist.txt \
                               --confirm
                         volumeMounts:
                           - name: config
