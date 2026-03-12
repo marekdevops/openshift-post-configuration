@@ -67,7 +67,7 @@
     # Wynik: (&(objectClass=person)(|(memberOf=CN=...)(memberOf=CN=...)))
     - name: "Przygotowanie — budowanie filtra LDAP dla OAuth"
       ansible.builtin.set_fact:
-        _oauth_group_filter: "(|({{ oauth_allowed_groups | map('regex_replace', '^(.*)$', '(' + ldap_group_membership_attribute + '=\\1)') | join('') }}))"
+        _oauth_group_filter: "(|{{ oauth_allowed_groups | map('regex_replace', '^(.*)$', '(' + ldap_group_membership_attribute + '=\\1)') | join('') }})"
       when: oauth_allowed_groups | length > 0
       tags: [always]
 
