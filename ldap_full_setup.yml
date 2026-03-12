@@ -285,12 +285,14 @@
     # członków synchronizowanych grup. Bez tego AD zwraca wszystkich userów
     # i wpada w "size limit exceeded" (LDAP result code 4).
     # Wynik: (&(objectClass=person)(|(memberOf=CN=...)(memberOf=CN=...)))
+    - name: "Przygotowanie — budowanie cześci memberOf dla filtra sync"
+      ansible.builtin.set_fact:
+        _sync_member_parts: "{{ ldap_sync_groups.keys() | map('regex_replace', '^(.*)$', '(' + ldap_group_membership_attribute + '=\\1)') | join('') }}"
+      tags: [sync]
+
     - name: "Przygotowanie — budowanie filtra usersQuery dla LDAPSyncConfig"
       ansible.builtin.set_fact:
-        _ldap_sync_user_filter: >-
-          (&{{ ldap_user_filter }}(|{{ ldap_sync_groups.keys()
-            | map('regex_replace', '^(.*)$', '(' + ldap_group_membership_attribute + '=\\1)')
-            | join('') }}))
+        _ldap_sync_user_filter: "(&{{ ldap_user_filter }}(|{{ _sync_member_parts }}))"
       tags: [sync]
 
     - name: "Przygotowanie — budowanie struktury LDAPSyncConfig"
