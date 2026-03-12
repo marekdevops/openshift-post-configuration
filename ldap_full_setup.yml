@@ -281,6 +281,18 @@
     #    hasło bind: referencja do pliku z Secretu — nie inline!
     # =========================================================================
 
+    # Budowanie filtra usersQuery — ogranicza pobieranie userów LDAP tylko do
+    # członków synchronizowanych grup. Bez tego AD zwraca wszystkich userów
+    # i wpada w "size limit exceeded" (LDAP result code 4).
+    # Wynik: (&(objectClass=person)(|(memberOf=CN=...)(memberOf=CN=...)))
+    - name: "Przygotowanie — budowanie filtra usersQuery dla LDAPSyncConfig"
+      ansible.builtin.set_fact:
+        _ldap_sync_user_filter: >-
+          (&{{ ldap_user_filter }}(|{{ ldap_sync_groups.keys()
+            | map('regex_replace', '^(.*)$', '(' + ldap_group_membership_attribute + '=\\1)')
+            | join('') }}))
+      tags: [sync]
+
     - name: "Przygotowanie — budowanie struktury LDAPSyncConfig"
       ansible.builtin.set_fact:
         _ldap_sync_config:
@@ -298,7 +310,7 @@
               scope: "{{ ldap_user_scope }}"
               derefAliases: never
               pageSize: 0
-              filter: "{{ ldap_user_filter }}"
+              filter: "{{ _ldap_sync_user_filter | trim }}"
             userNameAttributes:
               - "{{ ldap_username_attribute }}"
             groupMembershipAttributes:
