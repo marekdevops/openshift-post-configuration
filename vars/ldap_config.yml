@@ -1,0 +1,85 @@
+---
+# vars/ldap_config.yml
+# Konfiguracja autentykacji LDAP w OpenShift — wszystkie zmienne w jednym miejscu
+#
+# DOSTOSUJ PRZED URUCHOMIENIEM:
+#   1. Uzupełnij dane serwera LDAP (ldap_url, ldap_bind_dn, ldap_base_dn)
+#   2. Zaszyfruj hasło: ansible-vault encrypt_string 'hasło' --name ldap_bind_password
+#   3. Podaj grupy OAuth (kto może się logować) — format memberOf DN
+#   4. Podaj mapowanie grup do synchronizacji — DN → nazwa w OCP
+#   5. Podaj uprawnienia RBAC dla grup OCP
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Serwer LDAP
+# ---------------------------------------------------------------------------
+ldap_url: "ldaps://ldaps.example.com"          # adres serwera LDAP/LDAPS
+ldap_bind_dn: "cn=admin,dc=acme,dc=com"        # konto service account LDAP
+ldap_bind_password: "your_bind_password"        # ansible-vault encrypt_string zalecane!
+ldap_base_dn: "ou=users,dc=acme,dc=com"        # base DN dla użytkowników
+ldap_insecure: false                            # true = wyłącz weryfikację TLS (niezalecane prod)
+
+# Certyfikat CA dla LDAPS (pełna treść PEM).
+# Zostaw pusty jeśli certyfikat jest podpisany przez zaufany urząd.
+# Przykład: ldap_ca_cert: "{{ lookup('file', 'files/ldap-ca.crt') }}"
+ldap_ca_cert: ""
+
+# ---------------------------------------------------------------------------
+# OAuth IDP — nazwa providera widoczna na stronie logowania OCP
+# ---------------------------------------------------------------------------
+ldap_idp_name: "ldap"
+
+# Grupy które MOGĄ się logować do klastra przez OAuth (format: pełny DN grupy LDAP)
+# Tylko użytkownicy należący do tych grup będą mogli się uwierzytelnić.
+# Atrybut: memberOf (Active Directory) lub groupMembership (OpenLDAP)
+oauth_allowed_groups:
+  - "CN=ROLE_ocp4_prod,ou=users,dc=acme,dc=com"
+  - "CN=ROLE_ocp4_prodadmin,ou=users,dc=acme,dc=com"
+
+# ---------------------------------------------------------------------------
+# Mapowanie grup LDAP → grupy OpenShift (synchronizacja)
+#
+# klucz   = pełny DN grupy w LDAP (CN=...)
+# wartość = nazwa grupy w OpenShift (zostanie utworzona przy sync)
+# ---------------------------------------------------------------------------
+ldap_sync_groups:
+  "CN=ROLE_ocp4_prod,ou=users,dc=acme,dc=com": "ocp4-prod-users"
+  "CN=ROLE_ocp4_prodadmin,ou=users,dc=acme,dc=com": "ocp4-prod-admins"
+
+# ---------------------------------------------------------------------------
+# RBAC — uprawnienia dla zsynchronizowanych grup OCP
+#
+# Dostępne role OCP: view, edit, cluster-admin, storage-viewer (custom), ...
+# ClusterRoleBinding zostanie utworzony dla każdej pary (group, role).
+# ---------------------------------------------------------------------------
+ocp_group_roles:
+  - group: "ocp4-prod-users"
+    roles:
+      - "view"
+  - group: "ocp4-prod-admins"
+    roles:
+      - "cluster-admin"
+
+# ---------------------------------------------------------------------------
+# Ustawienia zapytania LDAP dla użytkowników
+# ---------------------------------------------------------------------------
+ldap_username_attribute: "sAMAccountName"      # atrybut LDAP jako login OCP
+ldap_group_membership_attribute: "memberOf"    # atrybut przynależności do grupy
+ldap_user_filter: "(objectClass=person)"       # filtr LDAP dla użytkowników
+ldap_user_scope: "sub"                         # base | one | sub
+
+# ---------------------------------------------------------------------------
+# Zasoby Kubernetes
+# ---------------------------------------------------------------------------
+ldap_namespace: "openshift-config"
+ldap_sa_name: "ldap-sync-sa"
+ldap_secret_name: "ldap-secret"
+ldap_ca_configmap_name: "ldap-ca"
+ldap_configmap_name: "ldap-sync-config"
+ldap_cronjob_name: "ldap-group-sync"
+ldap_oc_image: "registry.redhat.io/openshift4/ose-cli:latest"
+
+# ---------------------------------------------------------------------------
+# Harmonogram synchronizacji (składnia cron)
+# ---------------------------------------------------------------------------
+ldap_schedule: "*/30 * * * *"                 # co 30 minut
