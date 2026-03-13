@@ -205,7 +205,32 @@
       tags: [monitoring]
 
     # =========================================================================
-    # 6. Oczekiwanie na zakończenie rekonfiguracji MCP
+    # 6. Router — przeniesienie IngressControllera na infra nody
+    # =========================================================================
+
+    - name: "Router — IngressController default (nodeSelector infra)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operator.openshift.io/v1
+          kind: IngressController
+          metadata:
+            name: default
+            namespace: openshift-ingress-operator
+          spec:
+            nodePlacement:
+              nodeSelector:
+                matchLabels:
+                  node-role.kubernetes.io/infra: ""
+              tolerations:
+                - key: "node-role.kubernetes.io/infra"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+        merge_type: merge
+      tags: [router, monitoring]
+
+    # =========================================================================
+    # 7. Oczekiwanie na zakończenie rekonfiguracji MCP
     #    MCO drainuje i restartuje nody po jednym (wg maxUnavailable).
     #    Timeout: 30 min — przy 3 nodach powinno wystarczyć.
     # =========================================================================
@@ -249,6 +274,15 @@
       ignore_errors: true
       tags: [always, verify]
 
+    - name: "Weryfikacja — pody routera (gdzie się schedulują)"
+      ansible.builtin.command: >
+        oc get pods -n openshift-ingress
+        -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+      register: router_pods
+      changed_when: false
+      ignore_errors: true
+      tags: [always, verify]
+
     - name: "WYNIK — infra nody"
       ansible.builtin.debug:
         msg: "{{ infra_nodes_status.stdout_lines }}"
@@ -262,4 +296,9 @@
     - name: "WYNIK — pody monitoringu"
       ansible.builtin.debug:
         msg: "{{ monitoring_pods.stdout_lines }}"
+      tags: [always, verify]
+
+    - name: "WYNIK — pody routera"
+      ansible.builtin.debug:
+        msg: "{{ router_pods.stdout_lines }}"
       tags: [always, verify]
