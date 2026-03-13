@@ -1,0 +1,265 @@
+---
+# =============================================================================
+# infra_nodes_setup.yml
+# Playbook: Konwersja nodów worker → infra w OpenShift
+#
+# Co robi:
+#   1. Weryfikuje sesję oc i uprawnienia cluster-admin
+#   2. Weryfikuje że wskazane nody istnieją w klastrze
+#   3. Nadaje nodom etykietę node-role.kubernetes.io/infra
+#   4. Usuwa etykietę node-role.kubernetes.io/worker (jeśli infra_remove_worker_role: true)
+#   5. Opcjonalnie nakłada taint node-role.kubernetes.io/infra:NoSchedule
+#   6. Tworzy MachineConfigPool "infra" (dziedziczy konfigurację z worker)
+#   7. Przenosi stack monitoringu na infra nody (cluster-monitoring-config)
+#   8. Czeka na zakończenie rekonfiguracji MCP (nody restartują po jednym!)
+#   9. Wyświetla wynik końcowy
+#
+# UWAGA PRODUKCJA:
+#   Krok 6–8 powoduje drain i restart nodów (jeden na raz wg infra_mcp_max_unavailable).
+#   Łączny czas: ok. 10–15 min per node. Nie przerywaj playbooka w trakcie!
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   pip install kubernetes
+#
+# Uruchomienie:
+#   ansible-playbook infra_nodes_setup.yml
+#   ansible-playbook infra_nodes_setup.yml --check             # dry-run (bez restartu!)
+#   ansible-playbook infra_nodes_setup.yml --tags label        # tylko etykiety
+#   ansible-playbook infra_nodes_setup.yml --tags mcp          # tylko MachineConfigPool
+#   ansible-playbook infra_nodes_setup.yml --tags monitoring   # tylko monitoring ConfigMap
+#   ansible-playbook infra_nodes_setup.yml --tags verify       # tylko weryfikacja
+#
+# Klaster wykrywany z aktywnej sesji oc (~/.kube/config).
+# Wymagane uprawnienia: cluster-admin
+# =============================================================================
+
+- name: "OpenShift — konwersja nodów worker → infra"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/infra_nodes.yml
+
+  tasks:
+
+    # =========================================================================
+    # 0. Weryfikacja środowiska
+    # =========================================================================
+
+    - name: "Weryfikacja — aktywna sesja oc"
+      ansible.builtin.command: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+      tags: [always]
+
+    - name: "Weryfikacja — uprawnienia cluster-admin"
+      ansible.builtin.command: oc auth can-i '*' '*' --all-namespaces
+      register: can_admin
+      changed_when: false
+      failed_when: can_admin.stdout | trim != 'yes'
+      tags: [always]
+
+    - name: "INFO — plan konwersji"
+      ansible.builtin.debug:
+        msg:
+          - "Zalogowany jako         : {{ oc_user.stdout }}"
+          - "Nody do konwersji       : {{ infra_nodes | join(', ') }}"
+          - "Usuń etykietę worker    : {{ infra_remove_worker_role }}"
+          - "Taint infra:NoSchedule  : {{ infra_taint_enabled }}"
+          - "MCP max unavailable     : {{ infra_mcp_max_unavailable }}"
+          - "UWAGA: nody będą restartować po jednym — nie przerywaj!"
+      tags: [always]
+
+    # =========================================================================
+    # 1. Weryfikacja że wskazane nody istnieją
+    # =========================================================================
+
+    - name: "Weryfikacja — sprawdzenie czy nody istnieją w klastrze"
+      ansible.builtin.command: oc get node {{ item }}
+      loop: "{{ infra_nodes }}"
+      register: node_check
+      changed_when: false
+      failed_when: node_check.rc != 0
+      tags: [always, label]
+
+    # =========================================================================
+    # 2. Etykietowanie nodów jako infra
+    # =========================================================================
+
+    - name: "Label — nadanie node-role.kubernetes.io/infra"
+      kubernetes.core.k8s:
+        state: present
+        api_version: v1
+        kind: Node
+        name: "{{ item }}"
+        definition:
+          metadata:
+            labels:
+              node-role.kubernetes.io/infra: ""
+      loop: "{{ infra_nodes }}"
+      loop_control:
+        label: "infra → {{ item }}"
+      tags: [label]
+
+    - name: "Label — usunięcie node-role.kubernetes.io/worker"
+      ansible.builtin.command: >
+        oc label node {{ item }} node-role.kubernetes.io/worker- --overwrite
+      loop: "{{ infra_nodes }}"
+      loop_control:
+        label: "remove worker → {{ item }}"
+      when: infra_remove_worker_role | bool
+      register: remove_worker
+      changed_when: "'labeled' in remove_worker.stdout or 'unlabeled' in remove_worker.stdout"
+      tags: [label]
+
+    # =========================================================================
+    # 3. Taint (opcjonalnie)
+    # =========================================================================
+
+    - name: "Taint — node-role.kubernetes.io/infra:NoSchedule"
+      ansible.builtin.command: >
+        oc adm taint node {{ item }}
+        node-role.kubernetes.io/infra=:NoSchedule
+        --overwrite
+      loop: "{{ infra_nodes }}"
+      loop_control:
+        label: "taint infra:NoSchedule → {{ item }}"
+      when: infra_taint_enabled | bool
+      register: taint_result
+      changed_when: "'tainted' in taint_result.stdout"
+      tags: [taint]
+
+    # =========================================================================
+    # 4. MachineConfigPool "infra"
+    #    Dziedziczy konfigurację OS/kubelet z worker + infra (standard OCP).
+    #    Po utworzeniu MCP i labelowaniu nodów — MCO zaczyna drainować i restartować!
+    # =========================================================================
+
+    - name: "MachineConfigPool — tworzenie puli infra"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfigPool
+          metadata:
+            name: infra
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          spec:
+            nodeSelector:
+              matchLabels:
+                node-role.kubernetes.io/infra: ""
+            machineConfigSelector:
+              matchExpressions:
+                - key: machineconfiguration.openshift.io/role
+                  operator: In
+                  values:
+                    - worker
+                    - infra
+            maxUnavailable: "{{ infra_mcp_max_unavailable | int }}"
+      tags: [mcp]
+
+    # =========================================================================
+    # 5. Monitoring — przeniesienie na infra nody
+    #    Prometheus, Alertmanager, Thanos Querier dostają nodeSelector + toleration.
+    #    Toleration dodany zawsze — działa niezależnie czy taint jest włączony.
+    # =========================================================================
+
+    - name: "Monitoring — cluster-monitoring-config (nodeSelector infra)"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-monitoring-config
+            namespace: openshift-monitoring
+            labels:
+              app.kubernetes.io/managed-by: ansible
+          data:
+            config.yaml: |
+              prometheusK8s:
+                nodeSelector:
+                  node-role.kubernetes.io/infra: ""
+                tolerations:
+                  - key: "node-role.kubernetes.io/infra"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+              alertmanagerMain:
+                nodeSelector:
+                  node-role.kubernetes.io/infra: ""
+                tolerations:
+                  - key: "node-role.kubernetes.io/infra"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+              thanosQuerier:
+                nodeSelector:
+                  node-role.kubernetes.io/infra: ""
+                tolerations:
+                  - key: "node-role.kubernetes.io/infra"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+      tags: [monitoring]
+
+    # =========================================================================
+    # 6. Oczekiwanie na zakończenie rekonfiguracji MCP
+    #    MCO drainuje i restartuje nody po jednym (wg maxUnavailable).
+    #    Timeout: 30 min — przy 3 nodach powinno wystarczyć.
+    # =========================================================================
+
+    - name: "MCP — oczekiwanie na Updated (nody restartują — może potrwać kilkanaście minut)"
+      ansible.builtin.command: >
+        oc wait mcp/infra
+        --for condition=Updated
+        --timeout=30m
+      register: mcp_wait
+      changed_when: false
+      failed_when: mcp_wait.rc != 0
+      tags: [mcp]
+
+    # =========================================================================
+    # 7. Weryfikacja końcowa
+    # =========================================================================
+
+    - name: "Weryfikacja — etykiety i role nodów infra"
+      ansible.builtin.command: >
+        oc get nodes -l node-role.kubernetes.io/infra
+        -o custom-columns=NODE:.metadata.name,ROLES:.metadata.labels,TAINTS:.spec.taints
+      register: infra_nodes_status
+      changed_when: false
+      tags: [always, verify]
+
+    - name: "Weryfikacja — stan MachineConfigPool infra"
+      ansible.builtin.command: oc get mcp infra
+      register: mcp_status
+      changed_when: false
+      ignore_errors: true
+      tags: [always, verify]
+
+    - name: "Weryfikacja — pody monitoringu (gdzie się schedulują)"
+      ansible.builtin.command: >
+        oc get pods -n openshift-monitoring
+        -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+        --field-selector=status.phase=Running
+      register: monitoring_pods
+      changed_when: false
+      ignore_errors: true
+      tags: [always, verify]
+
+    - name: "WYNIK — infra nody"
+      ansible.builtin.debug:
+        msg: "{{ infra_nodes_status.stdout_lines }}"
+      tags: [always, verify]
+
+    - name: "WYNIK — MachineConfigPool"
+      ansible.builtin.debug:
+        msg: "{{ mcp_status.stdout_lines }}"
+      tags: [always, verify]
+
+    - name: "WYNIK — pody monitoringu"
+      ansible.builtin.debug:
+        msg: "{{ monitoring_pods.stdout_lines }}"
+      tags: [always, verify]

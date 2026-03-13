@@ -1,0 +1,28 @@
+---
+# vars/infra_nodes.yml
+# Konfiguracja konwersji worker → infra node
+#
+# DOSTOSUJ PRZED URUCHOMIENIEM:
+#   infra_nodes — lista nazw nodów do przekonwertowania (oc get nodes)
+# =============================================================================
+
+# Lista nodów do przekonwertowania na infra
+# oc get nodes | grep worker  — żeby sprawdzić dokładne nazwy
+infra_nodes:
+  - worker-1.example.com     # <-- podaj nazwy swoich nodów
+  - worker-2.example.com
+  - worker-3.example.com
+
+# Czy usunąć etykietę worker z infra nodów
+# true  = nody należą TYLKO do puli infra (zalecane)
+# false = nody mają obie role worker + infra
+infra_remove_worker_role: true
+
+# Taint — twarda izolacja infra nodów (opcjonalnie)
+# Jeśli true: tylko pody z tolerationem node-role.kubernetes.io/infra wejdą na te nody
+# Uwaga: przed włączeniem upewnij się że workloady systemowe mają toleration!
+infra_taint_enabled: false
+
+# MachineConfigPool — ile nodów naraz może być w trakcie rekonfiguracji
+# PRODUKCJA: 1 (konserwatywnie — jeden node restartuje na raz)
+infra_mcp_max_unavailable: 1
