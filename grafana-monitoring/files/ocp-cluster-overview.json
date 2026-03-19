@@ -323,7 +323,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "(1 - avg without (cpu) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))) * 100",
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
