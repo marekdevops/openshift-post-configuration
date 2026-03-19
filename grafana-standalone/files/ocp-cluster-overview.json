@@ -83,7 +83,7 @@
       "fieldConfig": {
         "defaults": { "color": { "mode": "thresholds" }, "custom": { "align": "left", "displayMode": "auto", "filterable": false, "minWidth": 100 } },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "name" }, "properties": [ { "id": "displayName", "value": "Pool" }, { "id": "custom.width", "value": 180 } ] },
+          { "matcher": { "id": "byName", "options": "pool" }, "properties": [ { "id": "displayName", "value": "Pool" }, { "id": "custom.width", "value": 180 } ] },
           { "matcher": { "id": "byName", "options": "Total" }, "properties": [ { "id": "custom.width", "value": 80 } ] },
           { "matcher": { "id": "byName", "options": "Updated" }, "properties": [ { "id": "custom.width", "value": 90 }, { "id": "custom.displayMode", "value": "color-background" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "yellow", "value": null }, { "color": "green", "value": 1 } ] } } ] },
           { "matcher": { "id": "byName", "options": "Degraded" }, "properties": [ { "id": "custom.width", "value": 90 }, { "id": "custom.displayMode", "value": "color-background" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } ] },
@@ -94,14 +94,14 @@
       "id": 51,
       "options": { "footer": { "show": false }, "showHeader": true },
       "transformations": [
-        { "id": "filterFieldsByName", "options": { "include": { "names": ["name", "Value #A", "Value #B", "Value #C", "Value #D"] } } },
+        { "id": "filterFieldsByName", "options": { "include": { "names": ["pool", "Value #A", "Value #B", "Value #C", "Value #D"] } } },
         { "id": "organize", "options": { "renameByName": { "Value #A": "Total", "Value #B": "Updated", "Value #C": "Degraded", "Value #D": "Unavailable" } } }
       ],
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "machine_config_pool_machine_count", "instant": true, "refId": "A", "format": "table" },
-        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "machine_config_pool_updated_machine_count", "instant": true, "refId": "B", "format": "table" },
-        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "machine_config_pool_degraded_machine_count", "instant": true, "refId": "C", "format": "table" },
-        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "machine_config_pool_unavailable_machine_count", "instant": true, "refId": "D", "format": "table" }
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mco_machine_count", "instant": true, "refId": "A", "format": "table" },
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mco_updated_machine_count", "instant": true, "refId": "B", "format": "table" },
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mco_degraded_machine_count", "instant": true, "refId": "C", "format": "table" },
+        { "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mco_unavailable_machine_count", "instant": true, "refId": "D", "format": "table" }
       ],
       "title": "MachineConfigPool Status",
       "type": "table"
