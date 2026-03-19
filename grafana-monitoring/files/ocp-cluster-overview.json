@@ -228,7 +228,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "count(cluster_operator_conditions{condition=\"Degraded\"} == 1) or vector(0)",
+          "expr": "sum(cluster_operator_conditions{condition=\"Degraded\"})",
           "legendFormat": "Degraded",
           "instant": true,
           "refId": "A"
@@ -269,7 +269,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "count(cluster_operator_conditions{condition=\"Progressing\"} == 1) or vector(0)",
+          "expr": "sum(cluster_operator_conditions{condition=\"Progressing\"})",
           "legendFormat": "Progressing",
           "instant": true,
           "refId": "A"
@@ -323,7 +323,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "expr": "(1 - avg without (cpu) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))) * 100",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
