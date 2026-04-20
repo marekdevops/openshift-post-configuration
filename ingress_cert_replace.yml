@@ -1,0 +1,381 @@
+---
+# =============================================================================
+# ingress_cert_replace.yml
+# Playbook: Podmiana certyfikatu wildcard dla domyślnego Ingress w OpenShift
+#
+# Co robi:
+#   1. Weryfikuje środowisko (sesja oc, uprawnienia cluster-admin)
+#   2. [backup]   Zapisuje aktualny stan IngressController do pliku backup
+#   3. [replace]  Tworzy/aktualizuje Secret TLS w openshift-ingress
+#   4. [replace]  Konfiguruje IngressController.spec.defaultCertificate
+#   5. [replace]  Czeka na rollout router Pods i weryfikuje certyfikat
+#   6. [rollback] Przywraca poprzedni stan IngressController z pliku backup
+#   7. [verify]   Sprawdza aktualnie skonfigurowany certyfikat
+#
+# Wymagania:
+#   ansible-galaxy collection install kubernetes.core
+#   pip install kubernetes
+#   Aktywna sesja oc z uprawnieniami cluster-admin
+#
+# Uruchomienie:
+#   ansible-playbook ingress_cert_replace.yml --tags replace
+#   ansible-playbook ingress_cert_replace.yml --tags replace --check   # dry-run
+#   ansible-playbook ingress_cert_replace.yml --tags backup            # tylko backup
+#   ansible-playbook ingress_cert_replace.yml --tags rollback          # przywrócenie
+#   ansible-playbook ingress_cert_replace.yml --tags verify            # weryfikacja
+#
+# Klucz prywatny — rekomendowane szyfrowanie:
+#   ansible-vault encrypt_string "$(cat wildcard.key)" --name cert_key_pem >> vars/ingress_certs.yml
+#   ansible-playbook ingress_cert_replace.yml --tags replace --ask-vault-pass
+#
+# Klaster wykrywany z aktywnej sesji oc (~/.kube/config).
+# =============================================================================
+
+- name: "OpenShift — podmiana certyfikatu Ingress (wildcard)"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars_files:
+    - vars/ingress_certs.yml
+
+  tasks:
+
+    # =========================================================================
+    # 0. Weryfikacja środowiska — tag: always
+    # =========================================================================
+
+    - name: "Weryfikacja — aktywna sesja oc"
+      ansible.builtin.command: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+      tags: [always]
+
+    - name: "Weryfikacja — wyświetl aktywnego użytkownika i klaster"
+      ansible.builtin.command: oc config current-context
+      register: oc_context
+      changed_when: false
+      tags: [always]
+
+    - name: "Weryfikacja — uprawnienia cluster-admin"
+      ansible.builtin.command: oc auth can-i '*' '*' --all-namespaces
+      register: oc_admin_check
+      changed_when: false
+      failed_when: "'yes' not in oc_admin_check.stdout"
+      tags: [always]
+
+    - name: "Weryfikacja — informacje o środowisku"
+      ansible.builtin.debug:
+        msg:
+          - "Użytkownik   : {{ oc_user.stdout }}"
+          - "Kontekst     : {{ oc_context.stdout }}"
+          - "Cluster-admin: tak"
+      tags: [always]
+
+    - name: "Weryfikacja — sprawdzenie zmiennych certyfikatów [replace]"
+      ansible.builtin.assert:
+        that:
+          - cert_wildcard_pem | length > 0
+          - cert_intermediate_pem | length > 0
+          - cert_key_pem | length > 0
+        fail_msg: >
+          Wymagane zmienne są puste. Uzupełnij cert_wildcard_pem,
+          cert_intermediate_pem i cert_key_pem w vars/ingress_certs.yml.
+          Klucz (cert_key_pem) zaszyfruj ansible-vault na środowisku produkcyjnym.
+        success_msg: "Certyfikaty zdefiniowane — kontynuuję."
+      tags: [replace]
+
+    # =========================================================================
+    # 1. Backup aktualnego stanu — tag: backup, replace
+    # =========================================================================
+
+    - name: "Backup — odczyt aktualnej nazwy Secretu defaultCertificate"
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        -o jsonpath='{.spec.defaultCertificate.name}'
+      register: _current_cert_secret
+      changed_when: false
+      tags: [backup, replace, rollback]
+
+    - name: "Backup — odczyt pełnej specyfikacji IngressController (YAML)"
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        -o yaml
+      register: _ingresscontroller_yaml
+      changed_when: false
+      tags: [backup, replace]
+
+    - name: "Backup — zapis stanu do pliku {{ ingress_cert_backup_file }}"
+      ansible.builtin.copy:
+        content: |
+          # =================================================================
+          # Backup IngressController '{{ ingress_controller_name }}'
+          # Klaster  : {{ oc_context.stdout }}
+          # Data     : {{ ansible_date_time.iso8601 }}
+          # Playbook : ingress_cert_replace.yml
+          # =================================================================
+          # Przywrócenie:
+          #   ansible-playbook ingress_cert_replace.yml --tags rollback
+          # =================================================================
+          previous_cert_secret_name: "{{ _current_cert_secret.stdout | default('') }}"
+        dest: "{{ ingress_cert_backup_file }}"
+        mode: "0600"
+      tags: [backup, replace]
+
+    - name: "Backup — zapis pełnej specyfikacji IngressController (snapshot)"
+      ansible.builtin.copy:
+        content: "{{ _ingresscontroller_yaml.stdout }}"
+        dest: "{{ ingress_cert_backup_file | regex_replace('\\.yml$', '-full-snapshot.yml') }}"
+        mode: "0600"
+      tags: [backup, replace]
+
+    - name: "Backup — aktualny stan certyfikatu"
+      ansible.builtin.debug:
+        msg: >
+          Poprzedni Secret defaultCertificate:
+          {{ _current_cert_secret.stdout | default('(brak — domyślny self-signed)') }}
+      tags: [backup, replace]
+
+    # =========================================================================
+    # 2. Budowanie łańcucha certyfikatów — tag: replace
+    # =========================================================================
+
+    - name: "Certyfikat — złóż pełny łańcuch TLS (wildcard + intermediate [+ root])"
+      ansible.builtin.set_fact:
+        _tls_cert_chain: >-
+          {{
+            (
+              [cert_wildcard_pem | trim, cert_intermediate_pem | trim]
+              + ([cert_root_pem | trim] if cert_root_pem | default('') | length > 0 else [])
+            ) | join('\n')
+          }}
+      tags: [replace]
+
+    # =========================================================================
+    # 3. Tworzenie/aktualizacja Secretu TLS — tag: replace
+    # =========================================================================
+
+    - name: "Secret TLS — utwórz lub zaktualizuj '{{ ingress_cert_secret_name }}' w {{ ingress_namespace }}"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ingress_cert_secret_name }}"
+            namespace: "{{ ingress_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/component: ingress-certificate
+            annotations:
+              ingress-cert/replaced-at: "{{ ansible_date_time.iso8601 }}"
+              ingress-cert/replaced-by: "{{ oc_user.stdout }}"
+              ingress-cert/previous-secret: >-
+                {{ _current_cert_secret.stdout | default('self-signed') }}
+          type: kubernetes.io/tls
+          stringData:
+            tls.crt: "{{ _tls_cert_chain | trim }}"
+            tls.key: "{{ cert_key_pem | trim }}"
+      tags: [replace]
+
+    # =========================================================================
+    # 4. Konfiguracja IngressController — tag: replace
+    # Zgodnie z dokumentacją RH: oc patch ingresscontroller.operator default
+    # https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/
+    #   html/security_and_compliance/configuring-certificates#replacing-default-ingress
+    # =========================================================================
+
+    - name: "IngressController — patch spec.defaultCertificate"
+      ansible.builtin.command: >
+        oc patch ingresscontroller.operator {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        --type=merge
+        -p '{"spec":{"defaultCertificate":{"name":"{{ ingress_cert_secret_name }}"}}}'
+      register: _patch_result
+      changed_when: "'no change' not in _patch_result.stdout"
+      tags: [replace]
+
+    - name: "IngressController — wynik patcha"
+      ansible.builtin.debug:
+        msg: "{{ _patch_result.stdout }}"
+      tags: [replace]
+
+    # =========================================================================
+    # 5. Oczekiwanie na rollout — tag: replace
+    # =========================================================================
+
+    - name: "Rollout — czekaj aż IngressController zakończy aktualizację (max {{ ingress_rollout_timeout }}s)"
+      ansible.builtin.command: >
+        oc rollout status deployment/router-{{ ingress_controller_name }}
+        -n {{ ingress_namespace }}
+        --timeout={{ ingress_rollout_timeout }}s
+      register: _rollout_status
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: _rollout_status.rc == 0
+      tags: [replace]
+
+    - name: "Rollout — status"
+      ansible.builtin.debug:
+        msg: "{{ _rollout_status.stdout_lines }}"
+      tags: [replace]
+
+    # =========================================================================
+    # 6. Weryfikacja certyfikatu — tag: replace, verify
+    # =========================================================================
+
+    - name: "Weryfikacja — pobierz domenę wildcard z IngressController"
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        -o jsonpath='{.status.domain}'
+      register: _ingress_domain
+      changed_when: false
+      tags: [replace, verify]
+
+    - name: "Weryfikacja — sprawdź aktualny Secret defaultCertificate"
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        -o jsonpath='{.spec.defaultCertificate.name}'
+      register: _verify_secret
+      changed_when: false
+      tags: [replace, verify]
+
+    - name: "Weryfikacja — sprawdź czy Secret TLS istnieje"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ _verify_secret.stdout }}"
+        namespace: "{{ ingress_namespace }}"
+      register: _verify_secret_info
+      when: _verify_secret.stdout | length > 0
+      tags: [replace, verify]
+
+    - name: "Weryfikacja — sprawdź certyfikat przez OpenSSL (SNI)"
+      ansible.builtin.command: >
+        openssl s_client
+        -connect console-openshift-console.{{ _ingress_domain.stdout }}:443
+        -servername console-openshift-console.{{ _ingress_domain.stdout }}
+        -showcerts
+        </dev/null
+      register: _openssl_check
+      changed_when: false
+      failed_when: false
+      when: _ingress_domain.stdout | length > 0
+      tags: [replace, verify]
+
+    - name: "Weryfikacja — dekoduj CN certyfikatu"
+      ansible.builtin.command: >
+        openssl s_client
+        -connect console-openshift-console.{{ _ingress_domain.stdout }}:443
+        -servername console-openshift-console.{{ _ingress_domain.stdout }}
+        </dev/null 2>/dev/null | openssl x509 -noout -subject -dates -issuer
+      register: _cert_info
+      changed_when: false
+      failed_when: false
+      when: _ingress_domain.stdout | length > 0
+      tags: [replace, verify]
+
+    - name: "Weryfikacja — podsumowanie"
+      ansible.builtin.debug:
+        msg:
+          - "=== CERTYFIKAT INGRESS — STATUS ==="
+          - "Domena Ingress     : {{ _ingress_domain.stdout | default('N/A') }}"
+          - "Secret w OCP       : {{ _verify_secret.stdout | default('(brak — self-signed)') }}"
+          - "Secret istnieje    : {{ 'tak' if (_verify_secret_info.resources | default([]) | length > 0) else 'nie / N/A' }}"
+          - "--- OpenSSL ---"
+          - "{{ _cert_info.stdout_lines | default(['OpenSSL check pominięty']) }}"
+      tags: [replace, verify]
+
+    # =========================================================================
+    # 7. Rollback — przywrócenie poprzedniego stanu — tag: rollback
+    # =========================================================================
+
+    - name: "Rollback — sprawdź czy plik backup istnieje"
+      ansible.builtin.stat:
+        path: "{{ ingress_cert_backup_file }}"
+      register: _backup_stat
+      tags: [rollback]
+
+    - name: "Rollback — BŁĄD: plik backup nie istnieje"
+      ansible.builtin.fail:
+        msg: >
+          Plik backup {{ ingress_cert_backup_file }} nie istnieje.
+          Uruchom najpierw: ansible-playbook ingress_cert_replace.yml --tags backup
+          lub backup jest tworzony automatycznie przez --tags replace.
+      when: not _backup_stat.stat.exists
+      tags: [rollback]
+
+    - name: "Rollback — załaduj zmienne z pliku backup"
+      ansible.builtin.include_vars:
+        file: "{{ ingress_cert_backup_file }}"
+      tags: [rollback]
+
+    - name: "Rollback — wyświetl cel przywrócenia"
+      ansible.builtin.debug:
+        msg: >
+          Przywracam IngressController '{{ ingress_controller_name }}'
+          do stanu: Secret='{{ previous_cert_secret_name | default('(brak — self-signed)') }}'
+      tags: [rollback]
+
+    - name: "Rollback — przywróć self-signed (usuń spec.defaultCertificate)"
+      ansible.builtin.command: >
+        oc patch ingresscontroller.operator {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        --type=json
+        -p '[{"op":"remove","path":"/spec/defaultCertificate"}]'
+      register: _rollback_remove
+      changed_when: _rollback_remove.rc == 0
+      failed_when:
+        - _rollback_remove.rc != 0
+        - "'not found' not in _rollback_remove.stderr | lower"
+        - "'does not exist' not in _rollback_remove.stderr | lower"
+      when: previous_cert_secret_name | default('') | length == 0
+      tags: [rollback]
+
+    - name: "Rollback — przywróć poprzedni Secret ({{ previous_cert_secret_name }})"
+      ansible.builtin.command: >
+        oc patch ingresscontroller.operator {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        --type=merge
+        -p '{"spec":{"defaultCertificate":{"name":"{{ previous_cert_secret_name }}"}}}'
+      register: _rollback_patch
+      changed_when: "'no change' not in _rollback_patch.stdout"
+      when: previous_cert_secret_name | default('') | length > 0
+      tags: [rollback]
+
+    - name: "Rollback — czekaj na rollout (max {{ ingress_rollout_timeout }}s)"
+      ansible.builtin.command: >
+        oc rollout status deployment/router-{{ ingress_controller_name }}
+        -n {{ ingress_namespace }}
+        --timeout={{ ingress_rollout_timeout }}s
+      register: _rollback_rollout
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: _rollback_rollout.rc == 0
+      tags: [rollback]
+
+    - name: "Rollback — weryfikacja stanu po przywróceniu"
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_operator_namespace }}
+        -o jsonpath='{.spec.defaultCertificate.name}'
+      register: _rollback_verify
+      changed_when: false
+      tags: [rollback]
+
+    - name: "Rollback — podsumowanie"
+      ansible.builtin.debug:
+        msg:
+          - "=== ROLLBACK ZAKOŃCZONY ==="
+          - "IngressController : {{ ingress_controller_name }}"
+          - "Aktualny Secret   : {{ _rollback_verify.stdout | default('(self-signed — brak customowego)') }}"
+          - "Oczekiwano        : {{ previous_cert_secret_name | default('(self-signed)') }}"
+          - "Status            : {{ 'OK' if (_rollback_verify.stdout | default('') == previous_cert_secret_name | default('')) else 'RÓŻNICA — zweryfikuj ręcznie!' }}"
+      tags: [rollback]

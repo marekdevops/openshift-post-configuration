@@ -1,0 +1,79 @@
+---
+# vars/ingress_certs.yml
+# Konfiguracja certyfikatu wildcard dla Ingress OpenShift
+#
+# DOSTOSUJ PRZED URUCHOMIENIEM:
+#   1. Uzupełnij treść certyfikatów (patrz opcje poniżej)
+#   2. Podaj nazwę Secretu który zostanie utworzony w openshift-ingress
+#   3. Opcjonalnie zmień lokalizację pliku backup
+#
+# OPCJE PODAWANIA CERTYFIKATÓW:
+#   a) Z pliku (rekomendowane — pliki poza repo):
+#        cert_wildcard_pem: "{{ lookup('file', '/etc/ssl/ocp/wildcard.crt') }}"
+#
+#   b) Inline (rekomendowane szyfrowanie ansible-vault):
+#        ansible-vault encrypt_string "$(cat wildcard.crt)" --name cert_wildcard_pem
+#
+#   c) Inline plain-text (TYLKO dev/test — nie używać na produkcji):
+#        cert_wildcard_pem: |
+#          -----BEGIN CERTIFICATE-----
+#          ...
+#          -----END CERTIFICATE-----
+#
+# URUCHOMIENIE:
+#   ansible-playbook ingress_cert_replace.yml --tags replace
+#   ansible-playbook ingress_cert_replace.yml --tags replace --check     # dry-run
+#   ansible-playbook ingress_cert_replace.yml --tags rollback            # przywrócenie
+#   ansible-playbook ingress_cert_replace.yml --tags verify              # weryfikacja
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Certyfikaty — treść PEM
+# ---------------------------------------------------------------------------
+
+# Certyfikat wildcard (liść) — *.apps.klaster.example.com
+# Obsługuje ruch do wszystkich aplikacji przez domyślny Ingress
+cert_wildcard_pem: ""
+
+# Certyfikat pośredni (intermediate CA)
+# Podpisuje certyfikat wildcard — wymagany do zbudowania pełnego łańcucha
+cert_intermediate_pem: ""
+
+# Certyfikat root CA
+# Korzeń łańcucha zaufania. Zostaw pusty jeśli jest wbudowany w systemowy bundle OS.
+# Rekomendacja: dołącz zawsze — zwiększa przenośność konfiguracji.
+cert_root_pem: ""
+
+# Klucz prywatny dla certyfikatu wildcard
+# KRYTYCZNE: zaszyfruj ansible-vault na produkcji
+#   ansible-vault encrypt_string "$(cat wildcard.key)" --name cert_key_pem
+cert_key_pem: ""
+
+# ---------------------------------------------------------------------------
+# Zasoby Kubernetes / OpenShift
+# ---------------------------------------------------------------------------
+
+# Nazwa Secretu TLS który zostanie utworzony w namespace openshift-ingress
+# Konwencja: <env>-ingress-cert (np. prod-ingress-cert, staging-ingress-cert)
+ingress_cert_secret_name: "custom-ingress-cert"
+
+# Namespace operatora Ingress — nie zmieniać bez powodu
+ingress_namespace: "openshift-ingress"
+ingress_operator_namespace: "openshift-ingress-operator"
+ingress_controller_name: "default"
+
+# ---------------------------------------------------------------------------
+# Backup i rollback
+# ---------------------------------------------------------------------------
+
+# Lokalizacja pliku backup stworzonego przed zastąpieniem certyfikatu.
+# Plik MUSI istnieć (być wcześniej wygenerowany tagiem --tags replace lub --tags backup)
+# zanim uruchomisz --tags rollback.
+ingress_cert_backup_file: "/tmp/ingress-cert-backup-{{ ingress_controller_name }}.yml"
+
+# ---------------------------------------------------------------------------
+# Timeouty
+# ---------------------------------------------------------------------------
+
+# Czas oczekiwania (sekundy) na rollout IngressController po zmianie certyfikatu
+ingress_rollout_timeout: 300
