@@ -874,8 +874,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "node_filesystem_avail_bytes{mountpoint=\"/\", fstype!~\"tmpfs|overlay\"}",
-          "legendFormat": "{{instance}} — wolne na /",
+          "expr": "node_filesystem_avail_bytes{mountpoint=~\"/|/sysroot\", fstype!~\"tmpfs|overlay\"}",
+          "legendFormat": "{{instance}} {{mountpoint}}",
           "refId": "A"
         }
       ],
